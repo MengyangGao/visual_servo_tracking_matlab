@@ -19,11 +19,11 @@ from .scene import body_pose_world
 
 @dataclass(slots=True)
 class ServoGains:
-    feature: float = 2.4
-    position: float = 2.0
+    feature: float = 1.6
+    position: float = 2.2
     orientation: float = 1.0
-    damping: float = 0.08
-    max_joint_delta: float = 0.10
+    damping: float = 0.12
+    max_joint_delta: float = 0.06
 
 
 def _ee_jacobian(model: mujoco.MjModel, data: mujoco.MjData, body_name: str) -> np.ndarray:
@@ -122,12 +122,14 @@ def compute_servo_command(
     current_points = _feature_points_from_detection(detection)
     desired_points = _desired_feature_corners(prototype, camera_intrinsics)
     depth = float(detection.estimated_distance_m or prototype.nominal_standoff_m)
+    standoff = float(prototype.nominal_standoff_m)
     feature_error = np.zeros((8, 1), dtype=np.float64)
     for i in range(4):
-        feature_error[2 * i] = (current_points[i, 0] - desired_points[i, 0]) / camera_intrinsics.fx
-        feature_error[2 * i + 1] = (current_points[i, 1] - desired_points[i, 1]) / camera_intrinsics.fy
+        feature_error[2 * i] = current_points[i, 0] - desired_points[i, 0]
+        feature_error[2 * i + 1] = current_points[i, 1] - desired_points[i, 1]
     interaction = _interaction_matrix(current_points, depth, camera_intrinsics)
-    camera_twist_cam = -gains.feature * damped_pseudo_inverse(interaction, damping=gains.damping) @ feature_error
+    feature_scale = np.tile(np.array([camera_intrinsics.fx, camera_intrinsics.fy], dtype=np.float64), 4).reshape(-1, 1)
+    camera_twist_cam = -gains.feature * damped_pseudo_inverse(interaction, damping=gains.damping) @ (feature_error / feature_scale)
     camera_twist_cam = np.asarray(camera_twist_cam, dtype=float).reshape(6)
     camera_twist_world = np.concatenate(
         [
@@ -135,15 +137,22 @@ def compute_servo_command(
             camera_pose.rotation_world_from_cam @ camera_twist_cam[3:],
         ]
     )
-    forward = normalize(target_pos - ee_pos)
-    if np.any(forward):
-        desired_rot = look_at_rotation(forward, np.array([0.0, 0.0, 1.0], dtype=float))
-    else:
-        desired_rot = ee_rot
-    pos_error = target_pos - ee_pos
+    los = normalize(target_pos - ee_pos)
+    if not np.any(los):
+        los = ee_rot[:, 2]
+    desired_ee_pos = target_pos - los * standoff
+    desired_rot = look_at_rotation(target_pos - desired_ee_pos, np.array([0.0, 0.0, 1.0], dtype=float))
+    pos_error = desired_ee_pos - ee_pos
     ori_error = rotation_matrix_to_axis_angle(desired_rot @ ee_rot.T)
     jacobian = _ee_jacobian(model, data, ee_body_name)
-    qvel = damped_pseudo_inverse(jacobian, damping=gains.damping) @ camera_twist_world
+    pose_twist_world = np.concatenate(
+        [
+            gains.position * pos_error,
+            gains.orientation * ori_error,
+        ]
+    )
+    combined_twist_world = pose_twist_world + 0.35 * camera_twist_world
+    qvel = damped_pseudo_inverse(jacobian, damping=gains.damping) @ combined_twist_world
     qvel = np.asarray(qvel, dtype=float)
     if qvel.shape[0] > 0:
         norm = float(np.linalg.norm(qvel))
@@ -164,6 +173,8 @@ def compute_servo_command(
         position_error_m=float(np.linalg.norm(pos_error)),
         orientation_error_rad=float(np.linalg.norm(ori_error)),
         detection_score=float(detection.score),
+        target_distance_m=float(np.linalg.norm(target_pos - ee_pos)),
+        standoff_error_m=float(np.linalg.norm(target_pos - ee_pos) - standoff),
         feature_error_px=float(np.linalg.norm(feature_error)),
     )
     return qpos, telemetry

@@ -69,7 +69,9 @@ class ServoTelemetry:
     target_position_m: np.ndarray
     position_error_m: float
     orientation_error_rad: float
-    detection_score: float
+    detection_score: float = 0.0
+    target_distance_m: float = 0.0
+    standoff_error_m: float = 0.0
     feature_error_px: float = 0.0
 
 

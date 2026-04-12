@@ -11,6 +11,7 @@ from ._bootstrap import SRC  # noqa: F401
 
 from mujoco_servo.config import build_settings
 from mujoco_servo.control import ServoGains, compute_servo_command
+from mujoco_servo.config import moving_target_world_position
 from mujoco_servo.types import Detection
 from mujoco_servo.robot import build_robot_spec
 from mujoco_servo.scene import build_scene_bundle, set_mocap_body_pose
@@ -35,6 +36,8 @@ class RuntimeSmokeTest(unittest.TestCase):
             self.assertEqual(summary["mode"], "sim")
             self.assertEqual(summary["steps"], 8)
             self.assertIsNotNone(summary["final_position_error_m"])
+            self.assertIsNotNone(summary["final_target_distance_m"])
+            self.assertIsNotNone(summary["final_standoff_error_m"])
 
     def test_camera_heuristic_smoke(self) -> None:
         # This test is intentionally light: it validates backend wiring without requiring
@@ -104,6 +107,16 @@ class RuntimeSmokeTest(unittest.TestCase):
         self.assertEqual(qpos_cmd.shape[0], bundle.model.nq)
         self.assertTrue(np.isfinite(qpos_cmd).all())
         self.assertGreater(telemetry.feature_error_px, 0.0)
+        self.assertTrue(np.isfinite(telemetry.target_distance_m))
+        self.assertTrue(np.isfinite(telemetry.standoff_error_m))
+
+    def test_target_motion_is_smooth_and_non_static(self) -> None:
+        p0 = moving_target_world_position("cup", 0.0)
+        p1 = moving_target_world_position("cup", 2.0)
+        p2 = moving_target_world_position("cup", 4.0)
+        self.assertFalse(np.allclose(p0, p1))
+        self.assertFalse(np.allclose(p1, p2))
+        self.assertLess(np.linalg.norm(p2 - p1), 0.25)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ def _target_body_xml(proto: TargetPrototype, target_name: str = "target") -> str
         geom = f'<geom name="{target_name}_geom" type="box" size="{size[0] / 2.0:.4f} {size[1] / 2.0:.4f} {size[2] / 2.0:.4f}" rgba="{r} {g} {b} {a}"/>'
     return dedent(
         f"""
-        <body name="{target_name}" pos="{target_world_position(proto.name)[0]:.4f} {target_world_position(proto.name)[1]:.4f} {target_world_position(proto.name)[2]:.4f}">
+        <body name="{target_name}" mocap="true" pos="{target_world_position(proto.name)[0]:.4f} {target_world_position(proto.name)[1]:.4f} {target_world_position(proto.name)[2]:.4f}">
           {geom}
           <site name="{target_name}_site" pos="0 0 0" size="0.01" rgba="1 1 1 1"/>
         </body>

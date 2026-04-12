@@ -84,7 +84,12 @@ class MujocoSceneRenderer:
             self._follow_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, follow_body_name)
 
     def render(self, data: mujoco.MjData) -> np.ndarray:
-        if self._follow_body_id >= 0:
+        return self.render_with_lookat(data, None)
+
+    def render_with_lookat(self, data: mujoco.MjData, lookat: tuple[float, float, float] | None) -> np.ndarray:
+        if lookat is not None:
+            self._camera.lookat[:] = np.array(lookat, dtype=float)
+        elif self._follow_body_id >= 0:
             self._camera.lookat[:] = np.array(data.xpos[self._follow_body_id], dtype=float)
         self._renderer.update_scene(data, camera=self._camera)
         frame = self._renderer.render()
@@ -92,6 +97,9 @@ class MujocoSceneRenderer:
 
     def set_lookat(self, lookat: tuple[float, float, float]) -> None:
         self._camera.lookat[:] = np.array(lookat, dtype=float)
+
+    def set_distance(self, distance: float) -> None:
+        self._camera.distance = float(distance)
 
     def close(self) -> None:
         self._renderer.close()

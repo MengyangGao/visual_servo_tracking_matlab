@@ -65,6 +65,24 @@ def target_world_position(prompt: str) -> np.ndarray:
     return table.get(key, table["object"]).copy()
 
 
+def moving_target_world_position(prompt: str, time_s: float) -> np.ndarray:
+    base = target_world_position(prompt)
+    text = canonical_prompt(prompt)
+    phase = (sum(ord(ch) for ch in text) % 360) * np.pi / 180.0
+    t = float(max(time_s, 0.0))
+    offset = np.array(
+        [
+            0.085 * np.sin(0.55 * t + phase),
+            0.060 * np.sin(0.37 * t + 0.7 * phase),
+            0.030 * np.sin(0.47 * t + 0.4 * phase),
+        ],
+        dtype=float,
+    )
+    target = base + offset
+    target[2] = max(0.16, float(target[2]))
+    return target
+
+
 def default_camera_intrinsics(width: int, height: int) -> CameraIntrinsics:
     fx = 0.92 * width
     fy = 0.92 * width

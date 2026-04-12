@@ -1,14 +1,14 @@
 # MuJoCo Vision Servo
 
-This branch is the Python + MuJoCo replacement for the MATLAB deliverable.
+This branch is the Python + MuJoCo rebuild of the vision-servo project.
 
 ## What it does
 
-- Loads Franka Panda from `reference/mujoco_menagerie` when available.
-- Uses a fixed MuJoCo world viewer so robot motion stays visible.
-- Renders a second follow-view for the robot-side output frame.
-- Uses image-space feature corners, not a centroid-only controller.
-- Supports simulation and real-camera modes.
+- Uses Franka Panda from `reference/mujoco_menagerie` when available.
+- Runs a continuous visual-servo loop instead of one-shot detections.
+- Keeps the target moving in simulation so the follow behavior is visible.
+- Uses image-space corners plus a standoff pose target, so the end-effector stays facing the target at roughly 30 cm.
+- Supports simulation and real-camera modes with the same controller.
 - Supports `oracle`, `heuristic`, and `grounded-sam2` perception backends.
 
 ## Perception backends
@@ -23,7 +23,7 @@ Vision presets:
 - `small`: `IDEA-Research/grounding-dino-tiny` + `facebook/sam2.1-hiera-small`
 - `lite`: `IDEA-Research/grounding-dino-tiny` + `facebook/sam2.1-hiera-tiny`
 
-If SAM 2 is not available, the backend falls back to box-mask mode so the controller still runs.
+If SAM 2 is not available, the backend falls back to a box-mask mode so the controller still runs.
 
 ## Install
 
@@ -37,25 +37,31 @@ To enable the open-vocabulary backend:
 conda run -n mujoco python -m pip install -e ".[open-vocab]"
 ```
 
-If you have a local checkout of `reference/Grounded-SAM-2`, the backend uses it automatically. Otherwise set `MUJOCO_SERVO_SAM2_REPO` and `MUJOCO_SERVO_SAM2_CHECKPOINT`.
+If you have a local checkout of `reference/Grounded-SAM-2`, the backend can use it automatically. Otherwise set `MUJOCO_SERVO_SAM2_REPO` and `MUJOCO_SERVO_SAM2_CHECKPOINT`.
 
 The first `grounded-sam2` run downloads the Grounding DINO weights and the SAM 2 checkpoint into `mujoco/outputs/hf_cache`.
 
 ## Run
 
-Simulation:
+Simulation smoke test with a moving target:
 
 ```bash
-conda run -n mujoco python -m mujoco_servo sim --prompt "red apple"
+conda run -n mujoco python -m mujoco_servo sim --prompt "cup" --backend oracle --steps 240
 ```
 
-Real camera:
+Simulation with open-vocabulary perception:
+
+```bash
+conda run -n mujoco python -m mujoco_servo sim --prompt "cup" --backend grounded-sam2 --vision-preset lite --steps 240
+```
+
+Real-camera mode:
 
 ```bash
 mjpython -m mujoco_servo camera --prompt "cup" --backend grounded-sam2 --vision-preset lite --run-mode manual
 ```
 
-The camera mode uses the system camera and the fixed MuJoCo world viewer. The recorded/preview frame shows the follow-view plus the camera frame.
+The camera mode uses the system camera and the fixed MuJoCo world viewer. The robot view follows the end-effector and the detected target so motion stays visible.
 
 GUI:
 
@@ -71,7 +77,7 @@ conda run -n mujoco python -m mujoco_servo cameras
 
 ## Notes
 
-- The controller works from feature corners derived from detections.
-- The world viewer is intentionally static so motion stays visible.
+- The controller uses image corners, filtered detections, and a standoff pose target.
+- The simulation target moves continuously so the follow behavior is easy to see.
 - On macOS, camera access still depends on system permission prompts.
-- The open-vocabulary backend is optional; the smoke tests do not require it.
+- If the live camera path is unavailable, the simulation path remains the primary regression test.
