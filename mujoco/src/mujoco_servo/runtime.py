@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import threading
-import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -11,11 +9,11 @@ import cv2
 import mujoco
 import numpy as np
 
-from .camera import CameraStream, discover_cameras, open_camera
-from .config import AppSettings, build_settings, lookup_target_prototype, target_world_position
+from .camera import discover_cameras, open_camera
+from .config import AppSettings, build_settings, target_world_position
 from .config import project_root
 from .control import ServoGains, compute_servo_command
-from .geometry import normalize, rotation_matrix_to_quaternion_wxyz
+from .geometry import rotation_matrix_to_quaternion_wxyz
 from .perception import OracleBackend, PerceptionSession, build_backend
 from .robot import build_robot_spec
 from .scene import body_pose_world, build_scene_bundle

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -8,7 +9,13 @@ import numpy as np
 from ._bootstrap import SRC  # noqa: F401
 
 from mujoco_servo.config import default_camera_intrinsics, target_world_position
-from mujoco_servo.perception import OracleBackend, PerceptionBackend, PerceptionSession, PromptGuidedVisionBackend
+from mujoco_servo.perception import (
+    OracleBackend,
+    PerceptionBackend,
+    PerceptionSession,
+    PromptGuidedVisionBackend,
+    build_backend,
+)
 from mujoco_servo.types import CameraPose, Detection
 
 
@@ -94,6 +101,11 @@ class PerceptionTest(unittest.TestCase):
         self.assertAlmostEqual(float(x1), 160.0, delta=20.0)
         self.assertAlmostEqual(float(y1), 80.0, delta=20.0)
         self.assertGreater(tracked.mask_area_px, 0)
+
+    def test_grounded_sam2_backend_falls_back_when_constructor_fails(self) -> None:
+        with patch("mujoco_servo.perception.GroundedSam2Backend", side_effect=RuntimeError("no model")):
+            backend = build_backend("grounded-sam2", "cup", target_world_position)
+        self.assertEqual(backend.name, "heuristic")
 
 
 if __name__ == "__main__":

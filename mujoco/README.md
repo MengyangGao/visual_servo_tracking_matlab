@@ -13,7 +13,9 @@ This project is the new Python + MuJoCo vision-servo branch of the repo.
 
 - `oracle`: deterministic backend for simulation and tests
 - `heuristic`: classical prompt-guided fallback for real-camera development
-- `grounded-sam2`: optional open-vocabulary backend scaffold
+- `grounded-sam2`: open-vocabulary backend that uses Grounding DINO for text grounding and SAM 2 for segmentation when SAM 2 is available
+
+If SAM 2 is not installed or the checkpoint is not configured, the backend still runs in box-mask mode so the controller remains usable.
 
 The code is written so the controller does not depend on backend-specific output shapes.
 
@@ -24,6 +26,15 @@ Install the package first:
 ```bash
 conda run -n mujoco python -m pip install -e .
 ```
+
+To enable the open-vocabulary backend:
+
+```bash
+conda run -n mujoco python -m pip install -e ".[open-vocab]"
+```
+
+If you have a local checkout of the SAM 2 reference repository, the backend will use it automatically when it finds `reference/Grounded-SAM-2`. Otherwise, point `MUJOCO_SERVO_SAM2_REPO` to the checkout path and set `MUJOCO_SERVO_SAM2_CHECKPOINT` to a SAM 2 checkpoint.
+If you prefer an editable install, run `conda run -n mujoco python -m pip install -e /path/to/Grounded-SAM-2` before launching the project.
 
 Then run the CLI:
 
@@ -43,9 +54,11 @@ For camera input:
 conda run -n mujoco python -m mujoco_servo camera --prompt "red cup"
 ```
 
+Use `--backend heuristic` if you want a lightweight local vision fallback without loading open-vocabulary weights.
+
 ## Notes
 
 - The Panda asset is loaded from the local `reference/` checkout when present.
 - If the reference asset is missing, the loader falls back to a small built-in arm scene so tests still run.
-- The open-vocabulary backend is scaffolded but not required for the smoke tests.
+- The open-vocabulary backend is optional and is not required for the smoke tests.
 - On macOS, camera access still depends on the terminal/process permission prompt from the operating system.

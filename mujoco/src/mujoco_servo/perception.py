@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import os
+import sys
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 import cv2
 import numpy as np
+import torch
+from PIL import Image
 
-from .config import TARGET_LIBRARY, canonical_prompt, default_camera_intrinsics, lookup_target_prototype
+from .config import canonical_prompt, lookup_target_prototype, project_root
 from .geometry import normalize
 from .types import CameraIntrinsics, CameraPose, Detection, TargetPrototype
 
@@ -23,6 +29,59 @@ def estimate_distance_from_bbox(
     real_width = max(float(prototype.size_m[0]), float(prototype.size_m[1]), 1e-3)
     pixel_extent = max(w, h)
     return float(intrinsics.fx * real_width / pixel_extent)
+
+
+@dataclass(slots=True)
+class GroundedSam2Config:
+    grounding_model_id: str = os.getenv("MUJOCO_SERVO_GDINO_MODEL_ID", "IDEA-Research/grounding-dino-tiny")
+    grounding_box_threshold: float = float(os.getenv("MUJOCO_SERVO_GDINO_BOX_THRESHOLD", "0.35"))
+    grounding_text_threshold: float = float(os.getenv("MUJOCO_SERVO_GDINO_TEXT_THRESHOLD", "0.25"))
+    sam2_model_cfg: str = os.getenv("MUJOCO_SERVO_SAM2_MODEL_CFG", "configs/sam2.1/sam2.1_hiera_l.yaml")
+    sam2_checkpoint: str = os.getenv("MUJOCO_SERVO_SAM2_CHECKPOINT", "")
+    device: str = os.getenv("MUJOCO_SERVO_DEVICE", "auto")
+    reference_repo: str = os.getenv("MUJOCO_SERVO_SAM2_REPO", "")
+    allow_bbox_fallback: bool = os.getenv("MUJOCO_SERVO_ALLOW_BBOX_FALLBACK", "1") != "0"
+
+
+def _ensure_path_on_sys_path(path: Path) -> None:
+    resolved = str(path.resolve())
+    if resolved not in sys.path:
+        sys.path.insert(0, resolved)
+
+
+def _default_reference_repo() -> Path | None:
+    env_root = os.getenv("MUJOCO_SERVO_SAM2_REPO", "").strip()
+    candidates = []
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+    candidates.append(Path(__file__).resolve().parents[3] / "reference" / "Grounded-SAM-2")
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            return candidate
+    return None
+
+
+def _normalize_grounding_prompt(prompt: str) -> str:
+    text = canonical_prompt(prompt)
+    return text if text.endswith(".") else f"{text}."
+
+
+def _mask_from_bbox(frame_shape: tuple[int, int, int] | tuple[int, int], bbox_xyxy: np.ndarray) -> np.ndarray:
+    height, width = frame_shape[:2]
+    x1, y1, x2, y2 = np.asarray(bbox_xyxy, dtype=float).reshape(4)
+    x1 = max(0, min(width, int(round(x1))))
+    y1 = max(0, min(height, int(round(y1))))
+    x2 = max(x1 + 1, min(width, int(round(x2))))
+    y2 = max(y1 + 1, min(height, int(round(y2))))
+    mask = np.zeros((height, width), dtype=np.uint8)
+    mask[y1:y2, x1:x2] = 255
+    return mask
+
+
+def _best_detection_index(scores: np.ndarray) -> int:
+    if scores.size == 0:
+        return -1
+    return int(np.argmax(scores))
 
 
 class PerceptionBackend(ABC):
@@ -282,10 +341,161 @@ class GroundedSam2Backend(PerceptionBackend):
             import importlib
 
             importlib.import_module("transformers")
-            importlib.import_module("sam2")
             return True
         except Exception:
             return False
+
+    def __init__(self, config: GroundedSam2Config | None = None):
+        if not self.available():
+            raise RuntimeError(
+                "Grounded SAM 2 backend requires the 'transformers' package. "
+                "Install the open-vocab extras or choose the heuristic backend."
+            )
+        self.config = config or GroundedSam2Config()
+        self.device = self._resolve_device(self.config.device)
+        self._processor = None
+        self._grounding_model = None
+        self._sam2_predictor = None
+        self._sam2_ready = False
+        self._load_models()
+
+    @staticmethod
+    def _resolve_device(device: str) -> str:
+        requested = canonical_prompt(device)
+        if requested in {"auto", ""}:
+            if torch.cuda.is_available():
+                return "cuda"
+            if torch.backends.mps.is_available():
+                return "mps"
+            return "cpu"
+        return requested
+
+    def _load_models(self) -> None:
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+        reference_repo = Path(self.config.reference_repo).expanduser() if self.config.reference_repo else _default_reference_repo()
+        if reference_repo is not None:
+            _ensure_path_on_sys_path(reference_repo)
+
+        cache_dir = project_root() / "outputs" / "hf_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HF_HOME", str(cache_dir))
+        os.environ.setdefault("HF_HUB_CACHE", str(cache_dir / "hub"))
+        os.environ.setdefault("HF_XET_CACHE", str(cache_dir / "xet"))
+        os.environ.setdefault("XDG_CACHE_HOME", str(cache_dir / "xdg"))
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+        self._processor = AutoProcessor.from_pretrained(self.config.grounding_model_id, cache_dir=str(cache_dir))
+        self._grounding_model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            self.config.grounding_model_id,
+            cache_dir=str(cache_dir),
+        ).to(self.device)
+
+        sam2_checkpoint = Path(self.config.sam2_checkpoint).expanduser() if self.config.sam2_checkpoint else None
+        if sam2_checkpoint is None or not sam2_checkpoint.exists():
+            self._sam2_ready = False
+            return
+
+        try:
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+            sam2_model = build_sam2(self.config.sam2_model_cfg, str(sam2_checkpoint), device=self.device)
+            self._sam2_predictor = SAM2ImagePredictor(sam2_model)
+            self._sam2_ready = True
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"SAM2 could not be initialized, falling back to box masks: {exc}", RuntimeWarning)
+            self._sam2_predictor = None
+            self._sam2_ready = False
+
+    def _predict_boxes(self, frame_bgr: np.ndarray, prompt: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        if self._processor is None or self._grounding_model is None:
+            raise RuntimeError("GroundingDINO model is not initialized")
+        image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        image_pil = Image.fromarray(image_rgb)
+        prompt_text = _normalize_grounding_prompt(prompt)
+        inputs = self._processor(images=image_pil, text=prompt_text, return_tensors="pt").to(self.device)
+        with torch.inference_mode():
+            outputs = self._grounding_model(**inputs)
+        results = self._processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=self.config.grounding_box_threshold,
+            text_threshold=self.config.grounding_text_threshold,
+            target_sizes=[image_pil.size[::-1]],
+        )
+        if not results:
+            return np.zeros((0, 4), dtype=float), np.zeros(0, dtype=float), []
+        boxes = results[0]["boxes"].detach().cpu().numpy()
+        scores = results[0]["scores"].detach().cpu().numpy()
+        labels = list(results[0]["labels"])
+        return boxes, scores, labels
+
+    def _segment_boxes(self, frame_bgr: np.ndarray, boxes_xyxy: np.ndarray) -> np.ndarray:
+        if boxes_xyxy.size == 0:
+            return np.zeros((0, frame_bgr.shape[0], frame_bgr.shape[1]), dtype=np.uint8)
+        if self._sam2_ready and self._sam2_predictor is not None:
+            image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            self._sam2_predictor.set_image(image_rgb)
+            masks, _, _ = self._sam2_predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box=np.asarray(boxes_xyxy, dtype=float),
+                multimask_output=False,
+            )
+            if masks.ndim == 2:
+                masks = masks[None, ...]
+            if masks.ndim == 4:
+                masks = masks.squeeze(1)
+            return masks.astype(np.uint8)
+        return np.stack([_mask_from_bbox(frame_bgr.shape, box) for box in boxes_xyxy], axis=0)
+
+    def _detect_best(self, frame_bgr: np.ndarray, prompt: str, intrinsics: CameraIntrinsics) -> Detection:
+        prototype = lookup_target_prototype(prompt)
+        boxes, scores, labels = self._predict_boxes(frame_bgr, prompt)
+        if boxes.size == 0:
+            return Detection(
+                success=False,
+                prompt=prompt,
+                label=prototype.name,
+                score=0.0,
+                bbox_xyxy=np.zeros(4, dtype=float),
+                centroid_px=np.zeros(2, dtype=float),
+                mask=None,
+                mask_area_px=0,
+                estimated_distance_m=None,
+                backend=self.name,
+            )
+        idx = _best_detection_index(scores)
+        if idx < 0:
+            return Detection(
+                success=False,
+                prompt=prompt,
+                label=prototype.name,
+                score=0.0,
+                bbox_xyxy=np.zeros(4, dtype=float),
+                centroid_px=np.zeros(2, dtype=float),
+                mask=None,
+                mask_area_px=0,
+                estimated_distance_m=None,
+                backend=self.name,
+            )
+        box = boxes[idx]
+        mask = self._segment_boxes(frame_bgr, boxes[[idx]])[0]
+        centroid = np.array([(box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0], dtype=float)
+        distance = estimate_distance_from_bbox(prototype, box, intrinsics)
+        return Detection(
+            success=True,
+            prompt=prompt,
+            label=str(labels[idx]) if idx < len(labels) else prototype.name,
+            score=float(scores[idx]),
+            bbox_xyxy=np.asarray(box, dtype=float),
+            centroid_px=centroid,
+            mask=mask,
+            mask_area_px=int(np.count_nonzero(mask)),
+            estimated_distance_m=distance,
+            backend=self.name,
+        )
 
     def track(
         self,
@@ -295,7 +505,14 @@ class GroundedSam2Backend(PerceptionBackend):
         camera_pose: CameraPose,
         previous_detection: Detection | None = None,
     ) -> Detection:
-        return self.detect(frame_bgr, prompt, intrinsics, camera_pose)
+        if previous_detection is not None and previous_detection.success:
+            left, top, right, bottom = PromptGuidedVisionBackend._roi_from_previous(frame_bgr.shape, previous_detection)
+            roi = frame_bgr[top:bottom, left:right]
+            if roi.size > 0:
+                local = self._detect_best(roi, prompt, intrinsics)
+                if local.success:
+                    return PromptGuidedVisionBackend._shift_detection(local, left, top, frame_bgr.shape)
+        return self._detect_best(frame_bgr, prompt, intrinsics)
 
     def detect(
         self,
@@ -304,10 +521,7 @@ class GroundedSam2Backend(PerceptionBackend):
         intrinsics: CameraIntrinsics,
         camera_pose: CameraPose,
     ) -> Detection:
-        raise RuntimeError(
-            "Grounded SAM 2 backend is scaffolded but not wired to weights in this workspace. "
-            "Use heuristic or oracle backend, or install/configure the model path."
-        )
+        return self._detect_best(frame_bgr, prompt, intrinsics)
 
 
 def build_backend(name: str, prompt: str, target_pose_provider: Callable[[str], np.ndarray]) -> PerceptionBackend:
@@ -317,13 +531,16 @@ def build_backend(name: str, prompt: str, target_pose_provider: Callable[[str], 
     if normalized in {"heuristic", "fallback", "opencv"}:
         return PromptGuidedVisionBackend()
     if normalized in {"grounded-sam2", "grounded_sam2", "open-vocab", "open_vocab"}:
-        if GroundedSam2Backend.available():
+        try:
             return GroundedSam2Backend()
-        return PromptGuidedVisionBackend()
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"Falling back to heuristic backend: {exc}", RuntimeWarning)
+            return PromptGuidedVisionBackend()
     if normalized == "auto":
-        if GroundedSam2Backend.available():
+        try:
             return GroundedSam2Backend()
-        return PromptGuidedVisionBackend()
+        except Exception:
+            return PromptGuidedVisionBackend()
     return PromptGuidedVisionBackend()
 
 
