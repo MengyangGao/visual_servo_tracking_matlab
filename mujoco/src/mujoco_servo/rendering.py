@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import cv2
 import mujoco
+from mujoco import viewer as mujoco_viewer
 import numpy as np
 
 
@@ -85,3 +86,29 @@ class MujocoSceneRenderer:
 
     def close(self) -> None:
         self._renderer.close()
+
+
+class MujocoViewerSession:
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        data: mujoco.MjData,
+        lookat: tuple[float, float, float] = (0.55, 0.0, 0.25),
+        distance: float = 1.6,
+        azimuth: float = 135.0,
+        elevation: float = -20.0,
+    ) -> None:
+        self._handle = mujoco_viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False)
+        self._handle.cam.lookat[:] = np.array(lookat, dtype=float)
+        self._handle.cam.distance = float(distance)
+        self._handle.cam.azimuth = float(azimuth)
+        self._handle.cam.elevation = float(elevation)
+
+    def sync(self) -> None:
+        self._handle.sync()
+
+    def is_running(self) -> bool:
+        return self._handle.is_running()
+
+    def close(self) -> None:
+        self._handle.close()

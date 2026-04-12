@@ -16,8 +16,8 @@ from .control import ServoGains, compute_servo_command
 from .geometry import rotation_matrix_to_quaternion_wxyz
 from .perception import GroundedSam2Config, OracleBackend, PerceptionSession, build_backend
 from .robot import build_robot_spec
-from .rendering import MujocoSceneRenderer, side_by_side_view
-from .scene import body_pose_world, build_scene_bundle
+from .rendering import MujocoSceneRenderer, MujocoViewerSession, side_by_side_view
+from .scene import body_pose_world, build_scene_bundle, set_mocap_body_pose
 from .types import CameraFrame, CameraIntrinsics, CameraPose, Detection, ServoTelemetry
 
 
@@ -100,12 +100,20 @@ def run_simulation(settings: AppSettings, stop_event: Optional[threading.Event] 
     dt = 1.0 / settings.control_rate_hz
     renderer = None
     writer = None
+    viewer = None
     if settings.show_view or settings.record:
         lookat = tuple(np.asarray(target_world_position(settings.prompt), dtype=float))
         renderer = MujocoSceneRenderer(
             model,
             width=settings.robot_view_width,
             height=settings.robot_view_height,
+            lookat=(lookat[0], lookat[1], lookat[2] + 0.05),
+        )
+    if settings.show_view:
+        lookat = tuple(np.asarray(target_world_position(settings.prompt), dtype=float))
+        viewer = MujocoViewerSession(
+            model,
+            data,
             lookat=(lookat[0], lookat[1], lookat[2] + 0.05),
         )
     trace: list[dict] = []
@@ -148,14 +156,15 @@ def run_simulation(settings: AppSettings, stop_event: Optional[threading.Event] 
             if aid >= 0:
                 data.ctrl[aid] = qpos_cmd[i]
         mujoco.mj_step(model, data)
+        set_mocap_body_pose(model, data, "vision_camera", bundle.camera_pose.translation_m, bundle.camera_pose.rotation_world_from_cam)
+        set_mocap_body_pose(model, data, "vision_target", telemetry.target_position_m)
+        if viewer is not None:
+            viewer.sync()
+            if not viewer.is_running():
+                break
         robot_view = renderer.render(data) if renderer is not None else None
         if settings.record and writer is None and robot_view is not None:
             writer = _make_writer(output_dir / "sim_tracking.mp4", (robot_view.shape[1], robot_view.shape[0]), settings.control_rate_hz)
-        if settings.show_view and robot_view is not None:
-            cv2.imshow("mujoco-servo", robot_view)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
-                break
         if writer is not None and robot_view is not None:
             writer.write(robot_view)
         trace.append(
@@ -171,6 +180,8 @@ def run_simulation(settings: AppSettings, stop_event: Optional[threading.Event] 
         step += 1
     if renderer is not None:
         renderer.close()
+    if viewer is not None:
+        viewer.close()
     if writer is not None:
         writer.release()
     if settings.show_view:
@@ -208,12 +219,20 @@ def run_camera(
     trace: list[dict] = []
     writer = None
     renderer = None
+    viewer = None
     if settings.show_view or settings.record:
         lookat = tuple(np.asarray(target_world_position(settings.prompt), dtype=float))
         renderer = MujocoSceneRenderer(
             model,
             width=settings.robot_view_width,
             height=settings.robot_view_height,
+            lookat=(lookat[0], lookat[1], lookat[2] + 0.05),
+        )
+    if settings.show_view:
+        lookat = tuple(np.asarray(target_world_position(settings.prompt), dtype=float))
+        viewer = MujocoViewerSession(
+            model,
+            data,
             lookat=(lookat[0], lookat[1], lookat[2] + 0.05),
         )
     last_good_detection: Detection | None = None
@@ -257,6 +276,12 @@ def run_camera(
                 if aid >= 0:
                     data.ctrl[aid] = qpos_cmd[i]
             mujoco.mj_step(model, data)
+            set_mocap_body_pose(model, data, "vision_camera", bundle.camera_pose.translation_m, bundle.camera_pose.rotation_world_from_cam)
+            set_mocap_body_pose(model, data, "vision_target", telemetry.target_position_m)
+            if viewer is not None:
+                viewer.sync()
+                if not viewer.is_running():
+                    break
             robot_view = renderer.render(data) if renderer is not None else None
             status = "tracking" if raw_detection.success else ("hold" if last_good_detection is not None else "searching")
             annotated = _overlay_status(
@@ -298,6 +323,8 @@ def run_camera(
             writer.release()
         if renderer is not None:
             renderer.close()
+        if viewer is not None:
+            viewer.close()
         if settings.show_view:
             cv2.destroyAllWindows()
     summary = {

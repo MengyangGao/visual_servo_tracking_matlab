@@ -33,11 +33,35 @@ def _target_body_xml(proto: TargetPrototype, target_name: str = "target") -> str
     ).strip()
 
 
+def _camera_marker_xml() -> str:
+    return dedent(
+        """
+        <body name="vision_camera" mocap="true" pos="0.18 -0.95 0.82">
+          <geom type="box" size="0.03 0.02 0.02" rgba="0.20 0.62 1.00 0.85"/>
+          <site name="vision_camera_site" pos="0 0 0" size="0.01" rgba="1 1 1 1"/>
+        </body>
+        """
+    ).strip()
+
+
+def _target_marker_xml(proto: TargetPrototype) -> str:
+    size = proto.size_m
+    return dedent(
+        f"""
+        <body name="vision_target" mocap="true" pos="{target_world_position(proto.name)[0]:.4f} {target_world_position(proto.name)[1]:.4f} {target_world_position(proto.name)[2]:.4f}">
+          <geom type="sphere" size="{max(size) * 0.18:.4f}" rgba="1.00 0.20 0.20 0.90"/>
+          <site name="vision_target_site" pos="0 0 0" size="0.008" rgba="1 1 1 1"/>
+        </body>
+        """
+    ).strip()
+
+
 def _inject_target(xml_text: str, proto: TargetPrototype, target_name: str = "target") -> str:
     marker = "</worldbody>"
     if marker not in xml_text:
         raise ValueError("scene XML is missing a worldbody closing tag")
-    return xml_text.replace(marker, f"{_target_body_xml(proto, target_name)}\n  {marker}", 1)
+    marker_block = "\n  ".join([_target_body_xml(proto, target_name), _camera_marker_xml(), _target_marker_xml(proto)])
+    return xml_text.replace(marker, f"{marker_block}\n  {marker}", 1)
 
 
 def _fallback_scene_xml(proto: TargetPrototype) -> str:
@@ -107,7 +131,7 @@ def _fallback_scene_xml(proto: TargetPrototype) -> str:
           </keyframe>
         </mujoco>
         """
-    ).replace("</worldbody>", f"{target}\n          </worldbody>")
+    ).replace("</worldbody>", f"{target}\n          {_camera_marker_xml()}\n          {_target_marker_xml(proto)}\n          </worldbody>")
 
 
 def build_scene_xml(robot_spec: RobotSpec, prompt: str) -> str:
@@ -150,6 +174,27 @@ def build_scene_bundle(robot_spec: RobotSpec, prompt: str, image_width: int, ima
         camera_intrinsics=intrinsics,
         camera_pose=camera_pose,
     )
+
+
+def set_mocap_body_pose(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    body_name: str,
+    position: np.ndarray,
+    rotation_world_from_body: np.ndarray | None = None,
+) -> bool:
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    if body_id < 0:
+        return False
+    mocap_id = int(model.body_mocapid[body_id])
+    if mocap_id < 0:
+        return False
+    data.mocap_pos[mocap_id] = np.asarray(position, dtype=float).reshape(3)
+    if rotation_world_from_body is not None:
+        from .geometry import rotation_matrix_to_quaternion_wxyz
+
+        data.mocap_quat[mocap_id] = rotation_matrix_to_quaternion_wxyz(np.asarray(rotation_world_from_body, dtype=float).reshape(3, 3))
+    return True
 
 
 def target_body_id(model: mujoco.MjModel, body_name: str = "target") -> int:
