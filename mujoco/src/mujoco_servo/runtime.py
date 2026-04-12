@@ -15,8 +15,8 @@ from .camera import CameraStream, discover_cameras, open_camera
 from .config import AppSettings, build_settings, lookup_target_prototype, target_world_position
 from .config import project_root
 from .control import ServoGains, compute_servo_command
-from .geometry import normalize
-from .perception import OracleBackend, PromptGuidedVisionBackend, build_backend
+from .geometry import normalize, rotation_matrix_to_quaternion_wxyz
+from .perception import OracleBackend, PerceptionSession, build_backend
 from .robot import build_robot_spec
 from .scene import body_pose_world, build_scene_bundle
 from .types import CameraFrame, CameraIntrinsics, CameraPose, Detection, ServoTelemetry
@@ -64,34 +64,68 @@ def _camera_intrinsics_for_frame(frame: np.ndarray) -> CameraIntrinsics:
     return CameraIntrinsics(fx=0.92 * w, fy=0.92 * w, cx=w / 2.0, cy=h / 2.0, width=w, height=h)
 
 
+def _hold_control(model: mujoco.MjModel, data: mujoco.MjData, prompt: str, backend: str, step: int, ee_body_name: str, detection_score: float) -> tuple[np.ndarray, ServoTelemetry]:
+    ee_pos, ee_rot = body_pose_world(model, data, ee_body_name)
+    qpos = np.array(data.qpos.copy(), dtype=float)
+    telemetry = ServoTelemetry(
+        step=step,
+        prompt=prompt,
+        backend=backend,
+        qpos=qpos.copy(),
+        qvel=np.zeros(model.nv, dtype=float),
+        ee_position_m=ee_pos.copy(),
+        ee_orientation_wxyz=rotation_matrix_to_quaternion_wxyz(ee_rot),
+        target_position_m=ee_pos.copy(),
+        position_error_m=0.0,
+        orientation_error_rad=0.0,
+        detection_score=float(detection_score),
+    )
+    return qpos, telemetry
+
+
 def run_simulation(settings: AppSettings, stop_event: Optional[threading.Event] = None) -> dict:
     output_dir = _resolve_output_dir(settings)
     robot_spec = build_robot_spec(prefer_reference=settings.use_reference_robot, scene_path=settings.robot_scene_path)
     bundle = build_scene_bundle(robot_spec, settings.prompt, settings.camera_width, settings.camera_height)
     model, data = bundle.model, bundle.data
     target_proto = bundle.target_proto
-    backend = OracleBackend(target_world_position)
+    session = PerceptionSession(OracleBackend(target_world_position), settings.prompt)
     gains = ServoGains()
     dt = 1.0 / settings.control_rate_hz
     trace: list[dict] = []
     limit = settings.max_steps
     step = 0
+    last_good_detection: Detection | None = None
     while step < limit:
         if stop_event is not None and stop_event.is_set():
             break
         frame = np.zeros((settings.camera_height, settings.camera_width, 3), dtype=np.uint8)
-        detection = backend.detect(frame, settings.prompt, bundle.camera_intrinsics, bundle.camera_pose)
-        qpos_cmd, telemetry = compute_servo_command(
-            model=model,
-            data=data,
-            detection=detection,
-            prototype=target_proto,
-            camera_intrinsics=bundle.camera_intrinsics,
-            camera_pose=bundle.camera_pose,
-            ee_body_name=bundle.ee_body_name,
-            gains=gains,
-            dt=dt,
-        )
+        raw_detection = session.update(frame, bundle.camera_intrinsics, bundle.camera_pose)
+        control_detection = raw_detection if raw_detection.success else last_good_detection
+        if control_detection is None:
+            qpos_cmd, telemetry = _hold_control(
+                model,
+                data,
+                settings.prompt,
+                raw_detection.backend,
+                step,
+                bundle.ee_body_name,
+                raw_detection.score,
+            )
+        else:
+            qpos_cmd, telemetry = compute_servo_command(
+                model=model,
+                data=data,
+                detection=control_detection,
+                prototype=target_proto,
+                camera_intrinsics=bundle.camera_intrinsics,
+                camera_pose=bundle.camera_pose,
+                ee_body_name=bundle.ee_body_name,
+                gains=gains,
+                dt=dt,
+            )
+            if raw_detection.success:
+                last_good_detection = raw_detection
         telemetry.step = step
         for i, name in enumerate(bundle.actuator_names[: min(7, model.nu)]):
             aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
@@ -101,9 +135,11 @@ def run_simulation(settings: AppSettings, stop_event: Optional[threading.Event] 
         trace.append(
             {
                 "step": step,
-                "backend": detection.backend,
+                "backend": raw_detection.backend,
                 "position_error_m": telemetry.position_error_m,
                 "orientation_error_rad": telemetry.orientation_error_rad,
+                "raw_success": raw_detection.success,
+                "used_hold": bool(not raw_detection.success and last_good_detection is None),
             }
         )
         step += 1
@@ -133,6 +169,7 @@ def run_camera(
     target_proto = bundle.target_proto
     camera = open_camera(settings.camera_index, width=settings.camera_width, height=settings.camera_height)
     backend = build_backend(settings.backend, settings.prompt, target_world_position)
+    session = PerceptionSession(backend, settings.prompt)
     gains = ServoGains()
     dt = 1.0 / settings.control_rate_hz
     frame_count = 0
@@ -140,6 +177,7 @@ def run_camera(
     writer = None
     if settings.record:
         writer = _make_writer(output_dir / "camera_tracking.mp4", (settings.camera_width, settings.camera_height), settings.control_rate_hz)
+    last_good_detection: Detection | None = None
     try:
         limit = settings.max_steps if settings.run_mode == "auto" or (not settings.show_view and stop_event is None) else None
         while limit is None or frame_count < limit:
@@ -148,29 +186,44 @@ def run_camera(
             frame = camera.read()
             intrinsics = _camera_intrinsics_for_frame(frame.image_bgr)
             camera_pose = _camera_pose_for_real_mode()
-            detection = backend.detect(frame.image_bgr, settings.prompt, intrinsics, camera_pose)
-            qpos_cmd, telemetry = compute_servo_command(
-                model=model,
-                data=data,
-                detection=detection,
-                prototype=target_proto,
-                camera_intrinsics=intrinsics,
-                camera_pose=camera_pose,
-                ee_body_name=bundle.ee_body_name,
-                gains=gains,
-                dt=dt,
-            )
+            raw_detection = session.update(frame.image_bgr, intrinsics, camera_pose)
+            control_detection = raw_detection if raw_detection.success else last_good_detection
+            if control_detection is None:
+                qpos_cmd, telemetry = _hold_control(
+                    model,
+                    data,
+                    settings.prompt,
+                    raw_detection.backend,
+                    frame_count,
+                    bundle.ee_body_name,
+                    raw_detection.score,
+                )
+            else:
+                qpos_cmd, telemetry = compute_servo_command(
+                    model=model,
+                    data=data,
+                    detection=control_detection,
+                    prototype=target_proto,
+                    camera_intrinsics=intrinsics,
+                    camera_pose=camera_pose,
+                    ee_body_name=bundle.ee_body_name,
+                    gains=gains,
+                    dt=dt,
+                )
+                if raw_detection.success:
+                    last_good_detection = raw_detection
             telemetry.step = frame_count
             for i, name in enumerate(bundle.actuator_names[: min(7, model.nu)]):
                 aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
                 if aid >= 0:
                     data.ctrl[aid] = qpos_cmd[i]
             mujoco.mj_step(model, data)
+            status = "tracking" if raw_detection.success else ("hold" if last_good_detection is not None else "searching")
             annotated = _overlay_status(
                 frame.image_bgr,
-                detection,
+                raw_detection if raw_detection.success else (last_good_detection or raw_detection),
                 telemetry,
-                title=f"{settings.mode} | {settings.run_mode} | {settings.prompt}",
+                title=f"{settings.mode} | {settings.run_mode} | {settings.prompt} | {status}",
             )
             if writer is not None:
                 writer.write(annotated)
@@ -182,11 +235,13 @@ def run_camera(
             trace.append(
                 {
                     "step": frame_count,
-                    "backend": detection.backend,
-                    "score": detection.score,
+                    "backend": raw_detection.backend,
+                    "score": raw_detection.score,
                     "position_error_m": telemetry.position_error_m,
                     "orientation_error_rad": telemetry.orientation_error_rad,
-                    "bbox": detection.bbox_xyxy.tolist(),
+                    "bbox": (raw_detection if raw_detection.success else (last_good_detection or raw_detection)).bbox_xyxy.tolist(),
+                    "raw_success": raw_detection.success,
+                    "used_hold": bool(not raw_detection.success and last_good_detection is not None),
                 }
             )
             frame_count += 1

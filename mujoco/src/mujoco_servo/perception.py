@@ -38,6 +38,16 @@ class PerceptionBackend(ABC):
     ) -> Detection:
         raise NotImplementedError
 
+    def track(
+        self,
+        frame_bgr: np.ndarray,
+        prompt: str,
+        intrinsics: CameraIntrinsics,
+        camera_pose: CameraPose,
+        previous_detection: Detection | None = None,
+    ) -> Detection:
+        return self.detect(frame_bgr, prompt, intrinsics, camera_pose)
+
 
 class OracleBackend(PerceptionBackend):
     name = "oracle"
@@ -74,6 +84,16 @@ class OracleBackend(PerceptionBackend):
             backend=self.name,
             target_position_world=target_position.copy(),
         )
+
+    def track(
+        self,
+        frame_bgr: np.ndarray,
+        prompt: str,
+        intrinsics: CameraIntrinsics,
+        camera_pose: CameraPose,
+        previous_detection: Detection | None = None,
+    ) -> Detection:
+        return self.detect(frame_bgr, prompt, intrinsics, camera_pose)
 
 
 class PromptGuidedVisionBackend(PerceptionBackend):
@@ -112,6 +132,55 @@ class PromptGuidedVisionBackend(PerceptionBackend):
         mask = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
         mask = cv2.dilate(mask, kernel, iterations=1)
         return mask
+
+    @staticmethod
+    def _roi_from_previous(frame_shape: tuple[int, int, int], previous_detection: Detection) -> tuple[int, int, int, int]:
+        h, w = frame_shape[:2]
+        x1, y1, x2, y2 = previous_detection.bbox_xyxy.astype(float)
+        bw = max(x2 - x1, 1.0)
+        bh = max(y2 - y1, 1.0)
+        pad_x = int(max(24.0, bw * 0.75))
+        pad_y = int(max(24.0, bh * 0.75))
+        left = max(0, int(x1) - pad_x)
+        top = max(0, int(y1) - pad_y)
+        right = min(w, int(x2) + pad_x)
+        bottom = min(h, int(y2) + pad_y)
+        return left, top, right, bottom
+
+    @staticmethod
+    def _shift_detection(
+        detection: Detection,
+        offset_x: int,
+        offset_y: int,
+        frame_shape: tuple[int, int, int] | tuple[int, int],
+    ) -> Detection:
+        shifted = Detection(
+            success=detection.success,
+            prompt=detection.prompt,
+            label=detection.label,
+            score=detection.score,
+            bbox_xyxy=detection.bbox_xyxy.copy(),
+            centroid_px=detection.centroid_px.copy(),
+            mask=detection.mask,
+            mask_area_px=detection.mask_area_px,
+            estimated_distance_m=detection.estimated_distance_m,
+            backend=detection.backend,
+            track_id=detection.track_id,
+            target_position_world=detection.target_position_world,
+        )
+        shifted.bbox_xyxy[[0, 2]] += offset_x
+        shifted.bbox_xyxy[[1, 3]] += offset_y
+        shifted.centroid_px[[0]] += offset_x
+        shifted.centroid_px[[1]] += offset_y
+        if shifted.mask is not None:
+            height, width = frame_shape[:2]
+            full_mask = np.zeros((height, width), dtype=detection.mask.dtype)
+            mask_h, mask_w = detection.mask.shape[:2]
+            x_end = min(width, offset_x + mask_w)
+            y_end = min(height, offset_y + mask_h)
+            full_mask[offset_y:y_end, offset_x:x_end] = detection.mask[: y_end - offset_y, : x_end - offset_x]
+            shifted.mask = full_mask
+        return shifted
 
     def detect(
         self,
@@ -186,6 +255,23 @@ class PromptGuidedVisionBackend(PerceptionBackend):
             backend=self.name,
         )
 
+    def track(
+        self,
+        frame_bgr: np.ndarray,
+        prompt: str,
+        intrinsics: CameraIntrinsics,
+        camera_pose: CameraPose,
+        previous_detection: Detection | None = None,
+    ) -> Detection:
+        if previous_detection is not None and previous_detection.success:
+            left, top, right, bottom = self._roi_from_previous(frame_bgr.shape, previous_detection)
+            roi = frame_bgr[top:bottom, left:right]
+            if roi.size > 0:
+                local_detection = self.detect(roi, prompt, intrinsics, camera_pose)
+                if local_detection.success:
+                    return self._shift_detection(local_detection, left, top, frame_bgr.shape)
+        return self.detect(frame_bgr, prompt, intrinsics, camera_pose)
+
 
 class GroundedSam2Backend(PerceptionBackend):
     name = "grounded-sam2"
@@ -200,6 +286,16 @@ class GroundedSam2Backend(PerceptionBackend):
             return True
         except Exception:
             return False
+
+    def track(
+        self,
+        frame_bgr: np.ndarray,
+        prompt: str,
+        intrinsics: CameraIntrinsics,
+        camera_pose: CameraPose,
+        previous_detection: Detection | None = None,
+    ) -> Detection:
+        return self.detect(frame_bgr, prompt, intrinsics, camera_pose)
 
     def detect(
         self,
@@ -230,3 +326,22 @@ def build_backend(name: str, prompt: str, target_pose_provider: Callable[[str], 
         return PromptGuidedVisionBackend()
     return PromptGuidedVisionBackend()
 
+
+@dataclass(slots=True)
+class PerceptionSession:
+    backend: PerceptionBackend
+    prompt: str
+    previous_detection: Detection | None = None
+
+    def update(
+        self,
+        frame_bgr: np.ndarray,
+        intrinsics: CameraIntrinsics,
+        camera_pose: CameraPose,
+    ) -> Detection:
+        if self.previous_detection is None:
+            detection = self.backend.detect(frame_bgr, self.prompt, intrinsics, camera_pose)
+        else:
+            detection = self.backend.track(frame_bgr, self.prompt, intrinsics, camera_pose, self.previous_detection)
+        self.previous_detection = detection if detection.success else self.previous_detection
+        return detection
