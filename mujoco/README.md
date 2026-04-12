@@ -35,6 +35,7 @@ conda run -n mujoco python -m pip install -e ".[open-vocab]"
 
 If you have a local checkout of the SAM 2 reference repository, the backend will use it automatically when it finds `reference/Grounded-SAM-2`. Otherwise, point `MUJOCO_SERVO_SAM2_REPO` to the checkout path and set `MUJOCO_SERVO_SAM2_CHECKPOINT` to a SAM 2 checkpoint.
 If you prefer an editable install, run `conda run -n mujoco python -m pip install -e /path/to/Grounded-SAM-2` before launching the project.
+The first `grounded-sam2` run downloads the Grounding DINO base weights and the SAM 2 checkpoint into `mujoco/outputs/hf_cache`.
 
 Then run the CLI:
 

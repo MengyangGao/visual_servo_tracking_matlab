@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+from huggingface_hub import hf_hub_download
 
 from .config import canonical_prompt, lookup_target_prototype, project_root
 from .geometry import normalize
@@ -33,13 +34,14 @@ def estimate_distance_from_bbox(
 
 @dataclass(slots=True)
 class GroundedSam2Config:
-    grounding_model_id: str = os.getenv("MUJOCO_SERVO_GDINO_MODEL_ID", "IDEA-Research/grounding-dino-tiny")
+    grounding_model_id: str = os.getenv("MUJOCO_SERVO_GDINO_MODEL_ID", "IDEA-Research/grounding-dino-base")
     grounding_box_threshold: float = float(os.getenv("MUJOCO_SERVO_GDINO_BOX_THRESHOLD", "0.35"))
     grounding_text_threshold: float = float(os.getenv("MUJOCO_SERVO_GDINO_TEXT_THRESHOLD", "0.25"))
-    sam2_model_cfg: str = os.getenv("MUJOCO_SERVO_SAM2_MODEL_CFG", "configs/sam2.1/sam2.1_hiera_l.yaml")
+    sam2_repo_id: str = os.getenv("MUJOCO_SERVO_SAM2_REPO", "facebook/sam2.1-hiera-base-plus")
+    sam2_model_cfg_name: str = os.getenv("MUJOCO_SERVO_SAM2_MODEL_CFG_NAME", "configs/sam2.1/sam2.1_hiera_b+.yaml")
+    sam2_checkpoint_name: str = os.getenv("MUJOCO_SERVO_SAM2_CHECKPOINT_NAME", "sam2.1_hiera_base_plus.pt")
     sam2_checkpoint: str = os.getenv("MUJOCO_SERVO_SAM2_CHECKPOINT", "")
     device: str = os.getenv("MUJOCO_SERVO_DEVICE", "auto")
-    reference_repo: str = os.getenv("MUJOCO_SERVO_SAM2_REPO", "")
     allow_bbox_fallback: bool = os.getenv("MUJOCO_SERVO_ALLOW_BBOX_FALLBACK", "1") != "0"
 
 
@@ -357,6 +359,8 @@ class GroundedSam2Backend(PerceptionBackend):
         self._grounding_model = None
         self._sam2_predictor = None
         self._sam2_ready = False
+        self._sam2_cfg_path: str | None = None
+        self._sam2_checkpoint_path: str | None = None
         self._load_models()
 
     @staticmethod
@@ -373,7 +377,7 @@ class GroundedSam2Backend(PerceptionBackend):
     def _load_models(self) -> None:
         from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
-        reference_repo = Path(self.config.reference_repo).expanduser() if self.config.reference_repo else _default_reference_repo()
+        reference_repo = _default_reference_repo()
         if reference_repo is not None:
             _ensure_path_on_sys_path(reference_repo)
 
@@ -391,16 +395,27 @@ class GroundedSam2Backend(PerceptionBackend):
             cache_dir=str(cache_dir),
         ).to(self.device)
 
-        sam2_checkpoint = Path(self.config.sam2_checkpoint).expanduser() if self.config.sam2_checkpoint else None
-        if sam2_checkpoint is None or not sam2_checkpoint.exists():
-            self._sam2_ready = False
-            return
+        sam2_checkpoint: Path | None = None
+        if self.config.sam2_checkpoint:
+            candidate = Path(self.config.sam2_checkpoint).expanduser()
+            if candidate.exists():
+                sam2_checkpoint = candidate
+        if sam2_checkpoint is None:
+            sam2_checkpoint = Path(
+                hf_hub_download(
+                    repo_id=self.config.sam2_repo_id,
+                    filename=self.config.sam2_checkpoint_name,
+                    cache_dir=str(cache_dir),
+                )
+            )
+        self._sam2_checkpoint_path = str(sam2_checkpoint)
+        self._sam2_cfg_path = self.config.sam2_model_cfg_name
 
         try:
             from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-            sam2_model = build_sam2(self.config.sam2_model_cfg, str(sam2_checkpoint), device=self.device)
+            sam2_model = build_sam2(self.config.sam2_model_cfg_name, str(sam2_checkpoint), device=self.device)
             self._sam2_predictor = SAM2ImagePredictor(sam2_model)
             self._sam2_ready = True
         except Exception as exc:  # noqa: BLE001
