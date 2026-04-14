@@ -92,10 +92,6 @@ end
 draw_camera_frame(ax1, cameraPoses(:, :, 1), 0.035, 'start', 1.6);
 draw_camera_frame(ax1, cameraPoses(:, :, end), 0.035, 'end', 1.6);
 apply_world_view(ax1, cfg, cfg.scene);
-lgd1 = legend(ax1, [hBoard, hCorners, hPath], {'Board plane', 'ChArUco corners', 'Camera path'}, ...
-    'Location', 'southoutside', 'Orientation', 'horizontal', 'NumColumns', 3);
-set(lgd1, 'AutoUpdate', 'off');
-legend(ax1, 'boxoff');
 axis(ax1, [cfg.scene.tableX, cfg.scene.tableY, -0.02, 0.85]);
 apply_axes_theme(ax1, 'plot');
 
@@ -273,10 +269,6 @@ end
 draw_camera_frame(ax, cameraPoses(:, :, 1), 0.035, 'start', 1.6);
 draw_camera_frame(ax, cameraPoses(:, :, end), 0.035, 'end', 1.6);
 apply_world_view(ax, cfg, cfg.scene);
-lgd = legend(ax, [hBoard, hCorners, hPath], {'Board plane', 'ChArUco corners', 'Camera path'}, ...
-    'Location', 'southoutside', 'Orientation', 'horizontal', 'NumColumns', 3);
-set(lgd, 'AutoUpdate', 'off');
-legend(ax, 'boxoff');
 axis(ax, [cfg.scene.tableX, cfg.scene.tableY, -0.02, 0.85]);
 apply_axes_theme(ax, 'plot');
 figurePaths.boardPath = fullfile(cfg.paths.calibration, 't1_calibration_board_path.png');
