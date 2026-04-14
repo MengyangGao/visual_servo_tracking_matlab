@@ -1,228 +1,150 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
-import tempfile
-from textwrap import dedent
 
 import mujoco
 import numpy as np
 
-from .config import canonical_camera_pose, default_camera_intrinsics, lookup_target_prototype, target_world_position
-from .geometry import normalize
-from .robot import RobotSpec
-from .types import CameraIntrinsics, CameraPose, SceneBundle, TargetPrototype
+from .config import AppConfig, BoardConfig
+from .geometry import board_pose_from_center, mujoco_camera_pose_from_internal_pose, rotation_matrix_to_quat_wxyz
+from .image_features import render_charuco_board_image
+from .types import Pose
 
 
-def _target_body_xml(proto: TargetPrototype, target_name: str = "target") -> str:
-    size = proto.size_m
-    r, g, b, a = proto.rgba
-    if proto.primitive == "sphere":
-        geom = f'<geom name="{target_name}_geom" type="sphere" size="{size[0] / 2.0:.4f}" rgba="{r} {g} {b} {a}"/>'
-    elif proto.primitive == "cylinder":
-        geom = f'<geom name="{target_name}_geom" type="cylinder" size="{size[0] / 2.0:.4f} {size[2] / 2.0:.4f}" rgba="{r} {g} {b} {a}"/>'
-    else:
-        geom = f'<geom name="{target_name}_geom" type="box" size="{size[0] / 2.0:.4f} {size[1] / 2.0:.4f} {size[2] / 2.0:.4f}" rgba="{r} {g} {b} {a}"/>'
-    return dedent(
-        f"""
-        <body name="{target_name}" mocap="true" pos="{target_world_position(proto.name)[0]:.4f} {target_world_position(proto.name)[1]:.4f} {target_world_position(proto.name)[2]:.4f}">
-          {geom}
-          <site name="{target_name}_site" pos="0 0 0" size="0.01" rgba="1 1 1 1"/>
-        </body>
-        """
-    ).strip()
+@dataclass(slots=True)
+class SceneBundle:
+    model: mujoco.MjModel
+    data: mujoco.MjData
+    board_image: np.ndarray
+    board_texture_path: Path
+    scene_xml_path: Path
+    board_cfg: BoardConfig
+    target_body_name: str = "servo_target"
+    world_camera_name: str = "world_camera"
 
 
-def _camera_marker_xml() -> str:
-    return dedent(
-        """
-        <body name="vision_camera" mocap="true" pos="0.18 -0.95 0.82">
-          <geom type="box" size="0.058 0.038 0.038" rgba="0.20 0.62 1.00 0.90"/>
-          <site name="vision_camera_site" pos="0 0 0" size="0.01" rgba="1 1 1 1"/>
-        </body>
-        """
-    ).strip()
+def _xml_escape(path: Path) -> str:
+    return str(path).replace("&", "&amp;")
 
 
-def _target_marker_xml(proto: TargetPrototype) -> str:
-    size = proto.size_m
-    return dedent(
-        f"""
-        <body name="vision_target" mocap="true" pos="{target_world_position(proto.name)[0]:.4f} {target_world_position(proto.name)[1]:.4f} {target_world_position(proto.name)[2]:.4f}">
-          <geom type="sphere" size="{max(size) * 0.30:.4f}" rgba="1.00 0.20 0.20 0.94"/>
-          <site name="vision_target_site" pos="0 0 0" size="0.008" rgba="1 1 1 1"/>
-        </body>
-        """
-    ).strip()
+def _resolve_panda_xml(cfg: AppConfig) -> Path:
+    source = cfg.paths.panda_xml
+    destination = cfg.paths.resolved_panda_xml
+    asset_dir = source.parent / "assets"
+
+    text = source.read_text(encoding="utf-8")
+
+    def _rewrite_file_attr(match: re.Match[str]) -> str:
+        file_path = Path(match.group(1))
+        if file_path.is_absolute():
+            return match.group(0)
+        return f'file="{(asset_dir / file_path).as_posix()}"'
+
+    resolved = re.sub(r'file="([^"]+)"', _rewrite_file_attr, text)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists() or destination.read_text(encoding="utf-8") != resolved:
+        destination.write_text(resolved, encoding="utf-8")
+    return destination
 
 
-def _ee_marker_xml() -> str:
-    return dedent(
-        """
-        <body name="vision_ee" mocap="true" pos="0.30 -0.10 0.45">
-          <geom type="sphere" size="0.030" rgba="0.10 0.80 1.00 0.98"/>
-          <geom type="box" size="0.020 0.014 0.008" pos="0.032 0 0" rgba="0.05 0.35 1.00 0.96"/>
-          <site name="vision_ee_site" pos="0 0 0" size="0.008" rgba="1 1 1 1"/>
-        </body>
-        """
-    ).strip()
+def _build_scene_xml(cfg: AppConfig) -> str:
+    render_charuco_board_image(cfg.board, cfg.paths.board_texture_png)
+    panda_xml = _resolve_panda_xml(cfg)
+
+    target_half_w = cfg.board.width_m * 0.5
+    target_half_h = cfg.board.height_m * 0.5
+    target_thickness = cfg.board.thickness_m * 0.5
+    target_pose = board_pose_from_center(cfg.target_center_m, np.array([1.0, 0.0, 0.0], dtype=np.float64))
+    target_quat = rotation_matrix_to_quat_wxyz(target_pose.rotation)
+    cam = mujoco_camera_pose_from_internal_pose(cfg.fixed_camera_pose)
+    quat = rotation_matrix_to_quat_wxyz(cam.rotation)
+
+    return f"""
+<mujoco model="panda_servo_scene">
+  <include file="{_xml_escape(panda_xml)}"/>
+
+  <statistic center="0.3 0.0 0.4" extent="1.2"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.12 0.18 0.24 1"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.32 0.48 0.68" rgb2="0.02 0.02 0.04" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.22 0.26 0.30" rgb2="0.14 0.16 0.18"
+      markrgb="0.82 0.82 0.82" width="512" height="512"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="8 8" reflectance="0.12"/>
+    <texture type="2d" name="charuco_board" file="{_xml_escape(cfg.paths.board_texture_png)}"/>
+    <material name="charuco_board_mat" texture="charuco_board" texuniform="true" reflectance="0.05"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.6" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <camera name="{cfg.sim.world_camera_name}" pos="{cam.position[0]} {cam.position[1]} {cam.position[2]}"
+      quat="{quat[0]} {quat[1]} {quat[2]} {quat[3]}"/>
+    <body name="{cfg.sim.world_camera_name}_marker" pos="{cam.position[0]} {cam.position[1]} {cam.position[2]}">
+      <site name="{cfg.sim.world_camera_name}_site" size="0.01" rgba="0.1 0.7 0.9 1"/>
+    </body>
+    <body name="servo_target" mocap="true" pos="{target_pose.position[0]} {target_pose.position[1]} {target_pose.position[2]}" quat="{target_quat[0]} {target_quat[1]} {target_quat[2]} {target_quat[3]}">
+      <geom name="servo_target_plate" type="box" size="{target_half_w} {target_half_h} {target_thickness}"
+        material="charuco_board_mat" rgba="1 1 1 1"/>
+      <site name="servo_target_center" pos="0 0 0" size="0.004" rgba="1 0.2 0.2 1"/>
+      <site name="servo_target_normal" pos="0 0 {target_thickness + 0.002}" size="0.003" rgba="0.2 0.8 1 1"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
 
 
-def _inject_target(xml_text: str, proto: TargetPrototype, target_name: str = "target") -> str:
-    marker = "</worldbody>"
-    if marker not in xml_text:
-        raise ValueError("scene XML is missing a worldbody closing tag")
-    marker_block = "\n  ".join([_target_body_xml(proto, target_name), _camera_marker_xml(), _target_marker_xml(proto), _ee_marker_xml()])
-    return xml_text.replace(marker, f"{marker_block}\n  {marker}", 1)
-
-
-def _fallback_scene_xml(proto: TargetPrototype) -> str:
-    size = proto.size_m
-    target = _target_body_xml(proto)
-    return dedent(
-        f"""
-        <mujoco model="panda_lite">
-          <compiler angle="radian" autolimits="true"/>
-          <option integrator="implicitfast" timestep="0.002"/>
-          <default>
-            <default class="arm">
-              <joint type="hinge" axis="0 0 1" damping="1" armature="0.05" range="-2.8973 2.8973"/>
-              <geom contype="0" conaffinity="0" rgba="0.7 0.7 0.7 1"/>
-              <position kp="40"/>
-            </default>
-          </default>
-          <worldbody>
-            <light pos="0 0 2" mode="trackcom"/>
-            <geom name="floor" type="plane" size="0 0 0.05" rgba="0.15 0.15 0.15 1"/>
-            <body name="base" pos="0 0 0.0">
-              <geom type="cylinder" size="0.08 0.05" rgba="0.2 0.2 0.2 1"/>
-              <body name="link1" pos="0 0 0.15">
-                <joint name="joint1" class="arm"/>
-                <geom type="capsule" fromto="0 0 0 0 0 0.18" size="0.03" rgba="0.85 0.85 0.9 1"/>
-                <body name="link2" pos="0 0 0.18">
-                  <joint name="joint2" class="arm" axis="0 1 0"/>
-                  <geom type="capsule" fromto="0 0 0 0.18 0 0" size="0.028" rgba="0.8 0.8 0.85 1"/>
-                  <body name="link3" pos="0.18 0 0">
-                    <joint name="joint3" class="arm"/>
-                    <geom type="capsule" fromto="0 0 0 0 0 0.16" size="0.025" rgba="0.82 0.82 0.88 1"/>
-                    <body name="link4" pos="0 0 0.16">
-                      <joint name="joint4" class="arm" axis="0 1 0"/>
-                      <geom type="capsule" fromto="0 0 0 0.14 0 0" size="0.023" rgba="0.8 0.8 0.85 1"/>
-                      <body name="link5" pos="0.14 0 0">
-                        <joint name="joint5" class="arm"/>
-                        <geom type="capsule" fromto="0 0 0 0 0 0.14" size="0.02" rgba="0.83 0.83 0.88 1"/>
-                        <body name="link6" pos="0 0 0.14">
-                          <joint name="joint6" class="arm" axis="0 1 0"/>
-                          <geom type="capsule" fromto="0 0 0 0.12 0 0" size="0.018" rgba="0.8 0.8 0.85 1"/>
-                          <body name="link7" pos="0.12 0 0">
-                            <joint name="joint7" class="arm"/>
-                            <geom type="capsule" fromto="0 0 0 0 0 0.10" size="0.016" rgba="0.82 0.82 0.88 1"/>
-                            <body name="hand" pos="0 0 0.10">
-                              <geom type="box" size="0.03 0.03 0.05" rgba="0.2 0.2 0.2 1"/>
-                            </body>
-                          </body>
-                        </body>
-                      </body>
-                    </body>
-                  </body>
-                </body>
-              </body>
-            </body>
-          </worldbody>
-          <actuator>
-            <position name="actuator1" joint="joint1" kp="40"/>
-            <position name="actuator2" joint="joint2" kp="40"/>
-            <position name="actuator3" joint="joint3" kp="35"/>
-            <position name="actuator4" joint="joint4" kp="30"/>
-            <position name="actuator5" joint="joint5" kp="25"/>
-            <position name="actuator6" joint="joint6" kp="20"/>
-            <position name="actuator7" joint="joint7" kp="18"/>
-          </actuator>
-          <keyframe>
-            <key name="home" qpos="0 0 0 -1.57 0 1.57 -0.78"/>
-          </keyframe>
-        </mujoco>
-        """
-    ).replace(
-        "</worldbody>",
-        f"{target}\n          {_camera_marker_xml()}\n          {_target_marker_xml(proto)}\n          {_ee_marker_xml()}\n          </worldbody>",
-    )
-
-
-def build_scene_xml(robot_spec: RobotSpec, prompt: str) -> str:
-    proto = lookup_target_prototype(prompt)
-    if robot_spec.scene_xml_path is not None and robot_spec.scene_xml_path.exists():
-        text = robot_spec.scene_xml_path.read_text()
-        return _inject_target(text, proto)
-    return _fallback_scene_xml(proto)
-
-
-def build_scene_bundle(robot_spec: RobotSpec, prompt: str, image_width: int, image_height: int) -> SceneBundle:
-    xml_text = build_scene_xml(robot_spec, prompt)
-    if robot_spec.scene_xml_path is not None and robot_spec.scene_xml_path.exists():
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix="_tracking_scene.xml",
-            dir=robot_spec.scene_xml_path.parent,
-            delete=False,
-        ) as handle:
-            handle.write(xml_text)
-            temp_path = Path(handle.name)
-        try:
-            model = mujoco.MjModel.from_xml_path(str(temp_path))
-        finally:
-            temp_path.unlink(missing_ok=True)
-    else:
-        model = mujoco.MjModel.from_xml_string(xml_text)
+def build_scene(cfg: AppConfig) -> SceneBundle:
+    cfg.paths.ensure()
+    board_image = render_charuco_board_image(cfg.board, cfg.paths.board_texture_png)
+    xml_text = _build_scene_xml(cfg)
+    cfg.paths.generated_scene_xml.parent.mkdir(parents=True, exist_ok=True)
+    cfg.paths.generated_scene_xml.write_text(xml_text, encoding="utf-8")
+    model = mujoco.MjModel.from_xml_path(str(cfg.paths.generated_scene_xml))
     data = mujoco.MjData(model)
-    if model.nkey > 0:
-        mujoco.mj_resetDataKeyframe(model, data, 0)
-    mujoco.mj_forward(model, data)
-    intrinsics = default_camera_intrinsics(image_width, image_height)
-    camera_pose = canonical_camera_pose()
     return SceneBundle(
         model=model,
         data=data,
-        target_proto=lookup_target_prototype(prompt),
-        ee_body_name=robot_spec.ee_body_name,
-        actuator_names=robot_spec.actuator_names,
-        camera_intrinsics=intrinsics,
-        camera_pose=camera_pose,
+        board_image=board_image,
+        board_texture_path=cfg.paths.board_texture_png,
+        scene_xml_path=cfg.paths.generated_scene_xml,
+        board_cfg=cfg.board,
     )
 
 
-def set_mocap_body_pose(
-    model: mujoco.MjModel,
-    data: mujoco.MjData,
-    body_name: str,
-    position: np.ndarray,
-    rotation_world_from_body: np.ndarray | None = None,
-) -> bool:
+def set_mocap_pose(model: mujoco.MjModel, data: mujoco.MjData, body_name: str, pose: Pose) -> None:
     body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-    if body_id < 0:
-        return False
-    mocap_id = int(model.body_mocapid[body_id])
+    mocap_id = model.body_mocapid[body_id]
     if mocap_id < 0:
-        return False
-    data.mocap_pos[mocap_id] = np.asarray(position, dtype=float).reshape(3)
-    if rotation_world_from_body is not None:
-        from .geometry import rotation_matrix_to_quaternion_wxyz
-
-        data.mocap_quat[mocap_id] = rotation_matrix_to_quaternion_wxyz(np.asarray(rotation_world_from_body, dtype=float).reshape(3, 3))
-    return True
+        raise ValueError(f"Body '{body_name}' is not a mocap body.")
+    data.mocap_pos[mocap_id] = pose.position
+    quat = rotation_matrix_to_quat_wxyz(pose.rotation)
+    data.mocap_quat[mocap_id] = quat
 
 
-def target_body_id(model: mujoco.MjModel, body_name: str = "target") -> int:
+def get_body_pose(model: mujoco.MjModel, data: mujoco.MjData, body_name: str) -> Pose:
     body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-    if body_id < 0:
-        raise KeyError(f"body '{body_name}' not found")
-    return body_id
+    return Pose(np.array(data.xpos[body_id], dtype=np.float64), np.array(data.xmat[body_id], dtype=np.float64).reshape(3, 3))
 
 
-def body_pose_world(model: mujoco.MjModel, data: mujoco.MjData, body_name: str) -> tuple[np.ndarray, np.ndarray]:
+def get_body_jacobian(model: mujoco.MjModel, data: mujoco.MjData, body_name: str) -> np.ndarray:
     body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-    if body_id < 0:
-        raise KeyError(f"body '{body_name}' not found")
-    pos = np.array(data.xpos[body_id], dtype=float)
-    rot = np.array(data.xmat[body_id], dtype=float).reshape(3, 3)
-    return pos, rot
+    jacp = np.zeros((3, model.nv), dtype=np.float64)
+    jacr = np.zeros((3, model.nv), dtype=np.float64)
+    mujoco.mj_jacBody(model, data, jacp, jacr, body_id)
+    return np.vstack([jacp, jacr])
+
+
+def reset_to_home(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+    key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    qpos = np.array(model.key_qpos[key_id], dtype=np.float64)
+    data.qpos[:] = qpos
+    data.qvel[:] = 0.0
+    mujoco.mj_forward(model, data)

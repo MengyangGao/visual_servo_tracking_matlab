@@ -1,139 +1,115 @@
 from __future__ import annotations
 
-import tempfile
-import unittest
-from pathlib import Path
-
-import mujoco
 import numpy as np
 
-from ._bootstrap import SRC  # noqa: F401
-
-from mujoco_servo.config import build_settings
-from mujoco_servo.control import ServoGains, compute_servo_command
-from mujoco_servo.config import moving_target_world_position
-from mujoco_servo.types import Detection
-from mujoco_servo.robot import build_robot_spec
-from mujoco_servo.scene import build_scene_bundle, set_mocap_body_pose
-from mujoco_servo.rendering import side_by_side_view, three_panel_view
-from mujoco_servo.runtime import run_camera, run_simulation
+from mujoco_servo.config import build_default_config
+from mujoco_servo import runtime
+from mujoco_servo.geometry import look_at
+from mujoco_servo.runtime import run_simulation
+from mujoco_servo.types import CameraIntrinsics
 
 
-class RuntimeSmokeTest(unittest.TestCase):
-    def test_simulation_smoke(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = build_settings(
-                prompt="apple",
-                backend="oracle",
-                mode="sim",
-                run_mode="auto",
-                max_steps=8,
-                show_view=False,
-                record=False,
-            )
-            settings.output_dir = Path(tmpdir)
-            summary = run_simulation(settings)
-            self.assertEqual(summary["mode"], "sim")
-            self.assertEqual(summary["steps"], 8)
-            self.assertIsNotNone(summary["final_position_error_m"])
-            self.assertIsNotNone(summary["final_target_distance_m"])
-            self.assertIsNotNone(summary["final_standoff_error_m"])
+class FakeInteractiveViewer:
+    def __init__(self) -> None:
+        self.statuses: list[list[str]] = []
+        self.motion_traces: list[tuple[int, int]] = []
+        self.image_panels: list[tuple[tuple[int, ...], ...]] = []
+        self.synced = 0
+        self.closed = False
 
-    def test_camera_heuristic_smoke(self) -> None:
-        # This test is intentionally light: it validates backend wiring without requiring
-        # the open-vocabulary model to be installed.
-        with tempfile.TemporaryDirectory() as tmpdir:
-            settings = build_settings(
-                prompt="red cup",
-                backend="heuristic",
-                mode="camera",
-                run_mode="auto",
-                max_steps=1,
-                camera_index=None,
-                show_view=False,
-                record=False,
-            )
-            settings.output_dir = Path(tmpdir)
-            try:
-                summary = run_camera(settings)
-            except RuntimeError as exc:
-                self.skipTest(f"camera unavailable in this environment: {exc}")
-            self.assertEqual(summary["mode"], "camera")
+    def set_status(self, lines) -> None:  # noqa: ANN001
+        self.statuses.append(list(lines))
 
-    def test_side_by_side_view_shapes(self) -> None:
-        robot = np.zeros((120, 160, 3), dtype=np.uint8)
-        camera = np.zeros((180, 240, 3), dtype=np.uint8)
-        robot[:] = (10, 20, 30)
-        camera[:] = (40, 50, 60)
-        combined = side_by_side_view(robot, camera)
-        self.assertEqual(combined.ndim, 3)
-        self.assertEqual(combined.shape[2], 3)
-        self.assertGreater(combined.shape[1], robot.shape[1] + camera.shape[1])
-        self.assertEqual(combined.dtype, np.uint8)
+    def set_motion_traces(
+        self,
+        target_positions,
+        ee_positions,
+        *,
+        trail_length=24,
+        current_target=None,
+        current_ee=None,
+        target_pose=None,
+        ee_pose=None,
+        workspace_center=None,
+        workspace_size=None,
+    ) -> None:  # noqa: ANN001
+        del trail_length, current_target, current_ee, target_pose, ee_pose, workspace_center, workspace_size
+        self.motion_traces.append((len(target_positions), len(ee_positions)))
 
-    def test_three_panel_view_shapes(self) -> None:
-        world = np.zeros((140, 200, 3), dtype=np.uint8)
-        follow = np.zeros((100, 180, 3), dtype=np.uint8)
-        camera = np.zeros((160, 240, 3), dtype=np.uint8)
-        dashboard = three_panel_view(
-            world,
-            follow,
-            camera,
-            footer_lines=["prompt=cup", "backend=oracle"],
-        )
-        self.assertEqual(dashboard.ndim, 3)
-        self.assertEqual(dashboard.shape[2], 3)
-        self.assertGreater(dashboard.shape[1], world.shape[1] + follow.shape[1] + camera.shape[1])
-        self.assertGreater(dashboard.shape[0], world.shape[0])
-        self.assertEqual(dashboard.dtype, np.uint8)
+    def set_image_panels(self, images, *, margin=16, gap=12) -> None:  # noqa: ANN001
+        del margin, gap
+        self.image_panels.append(tuple(tuple(image.shape) for image in images))
 
-    def test_scene_contains_visible_mocap_markers(self) -> None:
-        spec = build_robot_spec(prefer_reference=False)
-        bundle = build_scene_bundle(spec, "apple", 640, 480)
-        for body_name in ("vision_camera", "vision_target", "vision_ee"):
-            body_id = mujoco.mj_name2id(bundle.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-            self.assertGreaterEqual(body_id, 0)
-            self.assertTrue(set_mocap_body_pose(bundle.model, bundle.data, body_name, np.array([0.1, 0.2, 0.3]), np.eye(3)))
+    def set_image_panel(self, image_bgr, *, margin=16) -> None:  # noqa: ANN001
+        del margin
+        self.set_image_panels([image_bgr])
 
-    def test_feature_servo_command_uses_corners(self) -> None:
-        spec = build_robot_spec(prefer_reference=False)
-        bundle = build_scene_bundle(spec, "phone", 640, 480)
-        det = Detection(
-            success=True,
-            prompt="phone",
-            label="phone",
-            score=0.92,
-            bbox_xyxy=np.array([220.0, 140.0, 340.0, 280.0]),
-            centroid_px=np.array([280.0, 210.0]),
-            corners_px=np.array([[220.0, 140.0], [340.0, 140.0], [340.0, 280.0], [220.0, 280.0]]),
-            estimated_distance_m=0.42,
-            backend="heuristic",
-        )
-        qpos_cmd, telemetry = compute_servo_command(
-            model=bundle.model,
-            data=bundle.data,
-            detection=det,
-            prototype=bundle.target_proto,
-            camera_intrinsics=bundle.camera_intrinsics,
-            camera_pose=bundle.camera_pose,
-            ee_body_name=bundle.ee_body_name,
-            gains=ServoGains(),
-            dt=1.0 / 30.0,
-        )
-        self.assertEqual(qpos_cmd.shape[0], bundle.model.nq)
-        self.assertTrue(np.isfinite(qpos_cmd).all())
-        self.assertGreater(telemetry.feature_error_px, 0.0)
-        self.assertTrue(np.isfinite(telemetry.target_distance_m))
-        self.assertTrue(np.isfinite(telemetry.standoff_error_m))
+    def sync(self) -> None:
+        self.synced += 1
 
-    def test_target_motion_is_smooth_and_non_static(self) -> None:
-        p0 = moving_target_world_position("cup", 0.0)
-        p1 = moving_target_world_position("cup", 2.0)
-        p2 = moving_target_world_position("cup", 4.0)
-        self.assertFalse(np.allclose(p0, p1))
-        self.assertFalse(np.allclose(p1, p2))
-        self.assertLess(np.linalg.norm(p2 - p1), 0.25)
+    def is_running(self) -> bool:
+        return not self.closed
+
+    def close(self) -> None:
+        self.closed = True
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_simulation_smoke_run() -> None:
+    cfg = build_default_config()
+    cfg.sim.steps = 3
+    cfg.sim.display = False
+    cfg.sim.render_world = False
+    cfg.sim.record_video = False
+    cfg.camera = CameraIntrinsics(width=320, height=240, fx=250.0, fy=250.0)
+    result = run_simulation(cfg=cfg, task="t2-fixed", display=False)
+    assert len(result.samples) == 3
+    assert result.output_dir.exists()
+    assert result.samples[0].phase in {"aligning", "tracking"}
+    assert all(np.isclose(sample.target_pose.position[2], cfg.sim.target_height_m) for sample in result.samples)
+    assert np.allclose(result.samples[0].target_pose.rotation[:, 2], np.array([1.0, 0.0, 0.0]), atol=1e-6)
+
+
+def test_simulation_prefers_standard_viewer(monkeypatch) -> None:
+    cfg = build_default_config()
+    cfg.sim.steps = 1
+    cfg.sim.display = True
+    cfg.sim.render_world = True
+    cfg.sim.record_video = False
+    cfg.camera = CameraIntrinsics(width=320, height=240, fx=250.0, fy=250.0)
+
+    viewer = FakeInteractiveViewer()
+    shown: list[tuple[str, tuple[int, ...]]] = []
+
+    monkeypatch.setattr(runtime, "launch_interactive_viewer", lambda *args, **kwargs: viewer)
+    monkeypatch.setattr(runtime, "MuJoCoWorldRenderer", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("world renderer should not be created when viewer is available")))
+    monkeypatch.setattr(runtime.cv2, "imshow", lambda name, image: shown.append((name, tuple(image.shape))))
+    monkeypatch.setattr(runtime.cv2, "waitKey", lambda delay=1: 255)
+    monkeypatch.setattr(runtime.cv2, "destroyAllWindows", lambda: None)
+
+    result = run_simulation(cfg=cfg, task="t2-fixed", display=True)
+
+    assert len(result.samples) == 1
+    assert viewer.closed
+    assert viewer.synced == 1
+    assert viewer.statuses
+    assert viewer.statuses[0][0] == "mode: simulation/t2-fixed"
+    assert any(line.startswith("phase:") for line in viewer.statuses[0])
+    assert viewer.motion_traces
+    assert viewer.image_panels and len(viewer.image_panels[0]) == 2
+    assert any(name == "camera" for name, _ in shown)
+    assert any(name == "map" for name, _ in shown)
+    assert not any(name == "world" for name, _ in shown)
+
+
+def test_ray_plane_intersection_projects_to_fixed_height_plane() -> None:
+    intrinsics = CameraIntrinsics(width=640, height=480, fx=400.0, fy=400.0)
+    camera_pose = look_at(np.array([0.0, 0.0, 1.0]), np.array([0.0, 0.0, 0.42]), np.array([0.0, 1.0, 0.0]))
+    point = runtime._ray_plane_intersection_world(np.array([intrinsics.cx, intrinsics.cy]), camera_pose, intrinsics, 0.42)
+    assert np.allclose(point, np.array([0.0, 0.0, 0.42]), atol=1e-6)
+
+
+def test_lowpass_vector_limits_step_size() -> None:
+    previous = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    current = np.array([10.0, -10.0, 1.0], dtype=np.float64)
+    blended = runtime._lowpass_vector(previous, current, alpha=0.5, max_step=0.2)
+    assert np.allclose(blended, np.array([0.2, -0.2, 0.2], dtype=np.float64))

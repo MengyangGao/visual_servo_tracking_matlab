@@ -19,6 +19,7 @@ mujoco/.pytest_cache/
 mujoco/.mypy_cache/
 mujoco/.ruff_cache/
 mujoco/.venv/
+mujoco/src/*.egg-info/
 mujoco/outputs/
 mujoco/results/
 mujoco/runs/

@@ -1,120 +1,199 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+import sys
 
 import numpy as np
 
-from .types import AppSettings, CameraIntrinsics, CameraPose, TargetPrototype
-from .geometry import look_at_rotation
+from .geometry import look_at
+from .types import CameraIntrinsics, Pose
 
 
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+def discover_repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        panda_xml = parent / "reference" / "mujoco_menagerie" / "franka_emika_panda" / "panda.xml"
+        if panda_xml.exists():
+            return parent
+    raise FileNotFoundError("Could not locate repository root with reference/mujoco_menagerie.")
 
 
-def project_root() -> Path:
-    return repo_root() / "mujoco"
+def _default_camera_backend() -> str:
+    if sys.platform == "darwin":
+        return "avfoundation"
+    if sys.platform.startswith("linux"):
+        return "v4l2"
+    if sys.platform.startswith("win"):
+        return "dshow"
+    return "auto"
 
 
-def reference_root() -> Path:
-    return repo_root() / "reference"
+@dataclass(slots=True)
+class BoardConfig:
+    pattern_dims: tuple[int, int] = (7, 7)
+    square_length_m: float = 0.03
+    marker_length_m: float = 0.0225
+    dictionary_name: str = "DICT_4X4_1000"
+    image_size_px: tuple[int, int] = (2048, 2048)
+    margin_px: int = 0
+    border_bits: int = 1
+    thickness_m: float = 0.006
+
+    @property
+    def width_m(self) -> float:
+        return self.pattern_dims[0] * self.square_length_m
+
+    @property
+    def height_m(self) -> float:
+        return self.pattern_dims[1] * self.square_length_m
 
 
-def panda_scene_path() -> Path:
-    return reference_root() / "mujoco_menagerie" / "franka_emika_panda" / "scene.xml"
+@dataclass(slots=True)
+class SimulationConfig:
+    dt: float = 0.04
+    steps: int = 180
+    world_camera_name: str = "world_camera"
+    world_camera_height: int = 480
+    world_camera_width: int = 640
+    target_height_m: float = 0.42
+    target_offset_m: float = 0.48
+    target_motion_radius_m: tuple[float, float] = (0.30, 0.22)
+    target_motion_speed: float = 0.42
+    position_gain: float = 4.2
+    orientation_gain: float = 2.6
+    ibvs_gain: float = 1.0
+    ibvs_damping: float = 1e-3
+    ik_damping: float = 1e-3
+    joint_target_smoothing_alpha: float = 0.22
+    joint_target_max_step_rad: float = 0.10
+    align_position_threshold_m: float = 0.06
+    align_feature_threshold: float = 0.04
+    align_hold_frames: int = 6
+    align_timeout_frames: int = 10
+    hand_to_camera_translation_m: tuple[float, float, float] = (0.0, 0.0, 0.11)
+    hand_to_camera_rotation_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    target_opening_angle_deg: float = 0.0
+    gripper_ctrl: float = 255.0
+    record_video: bool = False
+    render_world: bool = False
+    render_camera: bool = True
+    display: bool = True
 
 
-TARGET_LIBRARY: dict[str, TargetPrototype] = {
-    "cup": TargetPrototype("cup", "cylinder", (0.08, 0.08, 0.10), (0.95, 0.35, 0.20, 1.0), aliases=("mug", "cup")),
-    "mug": TargetPrototype("cup", "cylinder", (0.08, 0.08, 0.10), (0.95, 0.35, 0.20, 1.0), aliases=("cup", "mug")),
-    "phone": TargetPrototype("phone", "box", (0.075, 0.010, 0.150), (0.15, 0.15, 0.15, 1.0), aliases=("phone", "mobile")),
-    "mobile": TargetPrototype("phone", "box", (0.075, 0.010, 0.150), (0.15, 0.15, 0.15, 1.0), aliases=("phone", "mobile")),
-    "mouse": TargetPrototype("mouse", "box", (0.060, 0.040, 0.100), (0.85, 0.80, 0.75, 1.0), aliases=("mouse",)),
-    "apple": TargetPrototype("apple", "sphere", (0.075, 0.075, 0.075), (0.90, 0.18, 0.18, 1.0), aliases=("apple",)),
-    "book": TargetPrototype("book", "box", (0.160, 0.025, 0.230), (0.18, 0.25, 0.75, 1.0), aliases=("book",)),
-    "bottle": TargetPrototype("bottle", "cylinder", (0.045, 0.045, 0.240), (0.10, 0.50, 0.90, 1.0), aliases=("bottle",)),
-    "box": TargetPrototype("box", "box", (0.110, 0.080, 0.110), (0.65, 0.45, 0.20, 1.0), aliases=("box",)),
-}
+@dataclass(slots=True)
+class LiveConfig:
+    source: str = "camera"
+    device_index: int = 0
+    video_path: str | None = None
+    camera_backend: str = field(default_factory=_default_camera_backend)
+    camera_width: int = 1280
+    camera_height: int = 720
+    prompt: str = "charuco board"
+    model_id: str = "IDEA-Research/grounding-dino-tiny"
+    sam_model_id: str = "facebook/sam2.1-hiera-tiny"
+    box_threshold: float = 0.25
+    text_threshold: float = 0.25
+    device: str = "auto"
+    inference_max_side: int = 960
+    use_sam2: bool = True
+    tracking_depth_m: float = 0.75
+    standoff_m: float = 0.88
+    target_box_fraction: float = 0.24
+    render_world: bool = False
+    max_frames: int = 0
+    record_video: bool = False
+    display: bool = True
+    detection_smoothing_alpha: float = 0.16
+    joint_target_smoothing_alpha: float = 0.20
+    joint_target_max_step_rad: float = 0.10
+    acquire_hold_frames: int = 3
+    align_position_threshold_m: float = 0.05
+    align_feature_threshold: float = 0.04
+    align_hold_frames: int = 4
+    align_timeout_frames: int = 6
 
 
-def canonical_prompt(prompt: str) -> str:
-    return " ".join(prompt.lower().strip().split())
+@dataclass(slots=True)
+class PathsConfig:
+    repo_root: Path
+    project_dir: Path
+    reference_dir: Path
+    panda_xml: Path
+    resolved_panda_xml: Path
+    outputs_dir: Path
+    results_dir: Path
+    cache_dir: Path
+    generated_scene_xml: Path
+    board_texture_png: Path
+    logs_dir: Path
+    plots_dir: Path
+    calibration_dir: Path
+
+    def ensure(self) -> None:
+        for path in [
+            self.outputs_dir,
+            self.results_dir,
+            self.cache_dir,
+            self.logs_dir,
+            self.plots_dir,
+            self.calibration_dir,
+        ]:
+            path.mkdir(parents=True, exist_ok=True)
 
 
-def lookup_target_prototype(prompt: str) -> TargetPrototype:
-    text = canonical_prompt(prompt)
-    for key, prototype in TARGET_LIBRARY.items():
-        if key in text or any(alias in text for alias in prototype.aliases):
-            return prototype
-    return TargetPrototype("object", "box", (0.10, 0.10, 0.10), (0.85, 0.25, 0.25, 1.0), aliases=("object",))
+@dataclass(slots=True)
+class AppConfig:
+    paths: PathsConfig
+    board: BoardConfig = field(default_factory=BoardConfig)
+    sim: SimulationConfig = field(default_factory=SimulationConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
+    camera: CameraIntrinsics | None = None
+    target_center_m: np.ndarray = field(default_factory=lambda: np.array([0.34, 0.0, 0.0], dtype=np.float64))
+    fixed_camera_pose: Pose = field(default_factory=Pose.identity)
+    eye_camera_offset: Pose = field(default_factory=Pose.identity)
+
+    def __post_init__(self) -> None:
+        if self.camera is None:
+            self.camera = CameraIntrinsics(width=1280, height=720, fx=900.0, fy=900.0)
+        self.target_center_m = np.asarray(self.target_center_m, dtype=np.float64).reshape(3)
+        self.target_center_m[2] = float(self.sim.target_height_m)
+        self.fixed_camera_pose = self.fixed_camera_pose.copy()
+        self.eye_camera_offset = self.eye_camera_offset.copy()
 
 
-def target_world_position(prompt: str) -> np.ndarray:
-    key = lookup_target_prototype(prompt).name
-    table = {
-        "cup": np.array([0.58, 0.10, 0.25], dtype=float),
-        "phone": np.array([0.62, -0.08, 0.24], dtype=float),
-        "mouse": np.array([0.55, -0.18, 0.24], dtype=float),
-        "apple": np.array([0.50, 0.18, 0.26], dtype=float),
-        "book": np.array([0.60, 0.00, 0.26], dtype=float),
-        "bottle": np.array([0.56, -0.22, 0.28], dtype=float),
-        "box": np.array([0.59, 0.03, 0.25], dtype=float),
-        "object": np.array([0.58, 0.05, 0.25], dtype=float),
-    }
-    return table.get(key, table["object"]).copy()
-
-
-def moving_target_world_position(prompt: str, time_s: float) -> np.ndarray:
-    base = target_world_position(prompt)
-    text = canonical_prompt(prompt)
-    phase = (sum(ord(ch) for ch in text) % 360) * np.pi / 180.0
-    t = float(max(time_s, 0.0))
-    offset = np.array(
-        [
-            0.085 * np.sin(0.55 * t + phase),
-            0.060 * np.sin(0.37 * t + 0.7 * phase),
-            0.030 * np.sin(0.47 * t + 0.4 * phase),
-        ],
-        dtype=float,
+def build_default_config() -> AppConfig:
+    repo_root = discover_repo_root()
+    project_dir = repo_root / "mujoco"
+    reference_dir = repo_root / "reference" / "mujoco_menagerie" / "franka_emika_panda"
+    paths = PathsConfig(
+        repo_root=repo_root,
+        project_dir=project_dir,
+        reference_dir=reference_dir,
+        panda_xml=reference_dir / "panda.xml",
+        resolved_panda_xml=project_dir / "outputs" / "cache" / "panda_resolved.xml",
+        outputs_dir=project_dir / "outputs",
+        results_dir=project_dir / "results",
+        cache_dir=project_dir / "outputs" / "cache",
+        generated_scene_xml=project_dir / "outputs" / "cache" / "panda_servo_scene.xml",
+        board_texture_png=project_dir / "outputs" / "cache" / "charuco_board.png",
+        logs_dir=project_dir / "outputs" / "logs",
+        plots_dir=project_dir / "outputs" / "plots",
+        calibration_dir=project_dir / "outputs" / "calibration",
     )
-    target = base + offset
-    target[2] = max(0.16, float(target[2]))
-    return target
+    paths.ensure()
 
+    fixed_camera = look_at(
+        eye=np.array([0.88, -0.92, 0.82], dtype=np.float64),
+        target=np.array([0.34, 0.0, 0.42], dtype=np.float64),
+        up=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+    )
+    eye_offset = Pose.identity()
+    target_center = np.array([0.34, 0.0, SimulationConfig().target_height_m], dtype=np.float64)
 
-def default_camera_intrinsics(width: int, height: int) -> CameraIntrinsics:
-    fx = 0.92 * width
-    fy = 0.92 * width
-    return CameraIntrinsics(fx=fx, fy=fy, cx=width / 2.0, cy=height / 2.0, width=width, height=height)
-
-
-def canonical_camera_pose() -> CameraPose:
-    translation = np.array([0.18, -0.95, 0.82], dtype=float)
-    look_at = np.array([0.56, 0.00, 0.25], dtype=float)
-    rotation = look_at_rotation(look_at - translation, np.array([0.0, 0.0, 1.0], dtype=float))
-    return CameraPose(translation_m=translation, rotation_world_from_cam=rotation)
-
-
-def build_settings(
-    prompt: str = "cup",
-    backend: str = "auto",
-    mode: str = "sim",
-    run_mode: str = "auto",
-    vision_preset: str = "default",
-    max_steps: int = 240,
-    camera_index: int | None = None,
-    show_view: bool = True,
-    record: bool = False,
-) -> AppSettings:
-    return AppSettings(
-        prompt=prompt,
-        backend=backend,
-        mode=mode,
-        run_mode=run_mode,
-        vision_preset=vision_preset,
-        max_steps=max_steps,
-        camera_index=camera_index,
-        show_view=show_view,
-        record=record,
+    return AppConfig(
+        paths=paths,
+        fixed_camera_pose=fixed_camera,
+        eye_camera_offset=eye_offset,
+        target_center_m=target_center,
     )

@@ -1,600 +1,752 @@
 from __future__ import annotations
 
-import json
-import os
-import sys
-import threading
+from collections import deque
 import warnings
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import mujoco
 import numpy as np
 
-from .camera import discover_cameras, open_camera
-from .config import AppSettings, build_settings, canonical_camera_pose, moving_target_world_position, target_world_position
-from .config import project_root
-from .control import ServoGains, compute_servo_command
-from .geometry import rotation_matrix_to_quaternion_wxyz
-from .perception import GroundedSam2Config, OracleBackend, PerceptionSession, build_backend
-from .robot import build_robot_spec
-from .rendering import MujocoSceneRenderer, MujocoViewerSession, ViewLayout, three_panel_view
-from .scene import body_pose_world, build_scene_bundle, set_mocap_body_pose
-from .types import CameraFrame, CameraIntrinsics, CameraPose, Detection, ServoTelemetry
+from .camera import VideoCaptureStream, maybe_resize
+from .config import AppConfig, build_default_config
+from .control import ImageBasedServo, PoseBasedServo, board_feature_error, camera_twist_to_joint_velocity
+from .geometry import board_pose_from_center, compose, inverse_pose, look_at, normalize
+from .image_features import bbox_from_mask, box_xyxy_to_corners, calibrate_from_charuco_images, centered_box_corners, mask_area, mask_centroid
+from .perception import CharucoTracker, GroundingDinoDetector, OpenVocabularyTracker, Sam2MaskGenerator
+from .rendering import MuJoCoWorldRenderer, VideoRecorder, mask_thumbnail, overlay_detection, overlay_points, overlay_thumbnail, synthesize_board_view, world_map_panel
+from .robot import PandaRobot
+from .scene import build_scene
+from .viewer import initial_viewer_pose, launch_interactive_viewer, running_under_mjpython
+from .types import Pose, RunSummary, TrackingSample
 
 
-@dataclass(slots=True)
-class _LoopState:
-    filtered_detection: Detection | None = None
-    missing_frames: int = 0
-    filtered_qpos: np.ndarray | None = None
+def _desired_camera_pose_for_target(board_pose: Pose, camera_distance_m: float) -> Pose:
+    from .geometry import look_at
+
+    camera_pos = board_pose.position + board_pose.rotation[:, 2] * float(camera_distance_m)
+    return look_at(camera_pos, board_pose.position, np.array([0.0, 0.0, 1.0], dtype=np.float64))
 
 
-def _blend_array(previous: np.ndarray | None, current: np.ndarray | None, alpha: float) -> np.ndarray | None:
-    if current is None:
-        return None if previous is None else previous.copy()
+def _desired_hand_pose_for_target(board_pose: Pose, camera_distance_m: float, camera_offset: Pose) -> Pose:
+    return compose(_desired_camera_pose_for_target(board_pose, camera_distance_m), inverse_pose(camera_offset))
+
+
+def _pixel_to_camera_point(pixel_xy: np.ndarray, depth_m: float, intrinsics) -> np.ndarray:
+    pixel_xy = np.asarray(pixel_xy, dtype=np.float64).reshape(2)
+    x = (pixel_xy[0] - intrinsics.cx) / intrinsics.fx * float(depth_m)
+    y = (pixel_xy[1] - intrinsics.cy) / intrinsics.fy * float(depth_m)
+    return np.array([x, y, float(depth_m)], dtype=np.float64)
+
+
+def _ray_plane_intersection_world(pixel_xy: np.ndarray, camera_pose: Pose, intrinsics, plane_z: float) -> np.ndarray:
+    pixel_xy = np.asarray(pixel_xy, dtype=np.float64).reshape(2)
+    x = (pixel_xy[0] - intrinsics.cx) / intrinsics.fx
+    y = (pixel_xy[1] - intrinsics.cy) / intrinsics.fy
+    ray_cam = normalize(np.array([x, y, 1.0], dtype=np.float64))
+    ray_world = camera_pose.rotation @ ray_cam
+    denom = float(ray_world[2])
+    if abs(denom) < 1e-9:
+        raise ValueError("Camera ray is parallel to the tracking plane.")
+    t = (float(plane_z) - float(camera_pose.position[2])) / denom
+    if t <= 0.0:
+        raise ValueError("Tracking plane lies behind the camera ray.")
+    return camera_pose.position + t * ray_world
+
+
+def _lowpass_vector(previous: np.ndarray | None, current: np.ndarray, alpha: float, max_step: float | None = None) -> np.ndarray:
+    current = np.asarray(current, dtype=np.float64).reshape(-1)
     if previous is None:
         return current.copy()
-    prev = np.asarray(previous, dtype=float)
-    curr = np.asarray(current, dtype=float)
-    if prev.shape != curr.shape:
-        return curr.copy()
-    return ((1.0 - alpha) * prev + alpha * curr).astype(float)
+    previous = np.asarray(previous, dtype=np.float64).reshape(-1)
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    blended = previous + alpha * (current - previous)
+    if max_step is None:
+        return blended
+    max_step = float(max_step)
+    delta = np.clip(blended - previous, -max_step, max_step)
+    return previous + delta
 
 
-def _smooth_detection(previous: Detection, current: Detection, alpha: float = 0.35) -> Detection:
-    corners = _blend_array(previous.corners_px, current.corners_px, alpha)
-    mask = current.mask if current.mask is not None else previous.mask
-    target_world = _blend_array(previous.target_position_world, current.target_position_world, alpha)
-    return Detection(
-        success=True,
-        prompt=current.prompt,
-        label=current.label,
-        score=float((1.0 - alpha) * previous.score + alpha * current.score),
-        bbox_xyxy=((1.0 - alpha) * previous.bbox_xyxy + alpha * current.bbox_xyxy).astype(float),
-        centroid_px=((1.0 - alpha) * previous.centroid_px + alpha * current.centroid_px).astype(float),
-        corners_px=corners,
-        mask=mask,
-        mask_area_px=int((1.0 - alpha) * previous.mask_area_px + alpha * current.mask_area_px),
-        estimated_distance_m=_blend_array(
-            np.array([previous.estimated_distance_m], dtype=float) if previous.estimated_distance_m is not None else None,
-            np.array([current.estimated_distance_m], dtype=float) if current.estimated_distance_m is not None else None,
-            alpha,
-        )[0]
-        if previous.estimated_distance_m is not None and current.estimated_distance_m is not None
-        else current.estimated_distance_m or previous.estimated_distance_m,
-        backend=current.backend,
-        track_id=current.track_id or previous.track_id,
-        target_position_world=target_world,
-    )
+_PREVIEW_BORDER_X = 24
+_PREVIEW_BORDER_Y = 30
 
 
-def _limit_command(previous: np.ndarray | None, current: np.ndarray, max_delta: float) -> np.ndarray:
-    command = np.asarray(current, dtype=float).copy()
-    if previous is None:
-        return command
-    prev = np.asarray(previous, dtype=float).reshape(-1)
-    if prev.shape != command.shape:
-        return command
-    delta = np.clip(command - prev, -max_delta, max_delta)
-    return prev + delta
+def _detection_box_and_center(det) -> tuple[np.ndarray, np.ndarray, float]:
+    box = np.asarray(det.box, dtype=np.float64).reshape(4)
+    if det.mask is not None:
+        mask_box = bbox_from_mask(det.mask)
+        if mask_box is not None:
+            box = mask_box
+        centroid = mask_centroid(det.mask)
+        if centroid is not None:
+            center = centroid
+        else:
+            center = np.array([(box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5], dtype=np.float64)
+        area = max(1.0, float(mask_area(det.mask)))
+        return box, center, area
+    center = np.array([(box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5], dtype=np.float64)
+    area = max(1.0, float((box[2] - box[0]) * (box[3] - box[1])))
+    return box, center, area
 
 
-def _tracking_lookat(ee_pos: np.ndarray, target_pos: np.ndarray) -> tuple[float, float, float]:
-    ee = np.asarray(ee_pos, dtype=float).reshape(3)
-    target = np.asarray(target_pos, dtype=float).reshape(3)
-    mid = 0.5 * (ee + target)
-    mid[2] = float(mid[2] + 0.12)
-    return float(mid[0]), float(mid[1]), float(mid[2])
-
-
-def _world_panel_lookat(prompt: str) -> tuple[float, float, float]:
-    target = np.asarray(target_world_position(prompt), dtype=float)
-    return float(target[0] - 0.05), float(target[1] - 0.25), float(target[2] + 0.22)
-
-
-def _camera_panel_lookat(prompt: str, target_pos: np.ndarray) -> tuple[float, float, float]:
-    target = np.asarray(target_pos, dtype=float).reshape(3)
-    nominal = np.asarray(target_world_position(prompt), dtype=float)
-    mid = 0.65 * target + 0.35 * nominal
-    mid[2] = float(mid[2] + 0.18)
-    return float(mid[0]), float(mid[1]), float(mid[2])
-
-
-def _sim_target_position(prompt: str, step: int, dt: float) -> np.ndarray:
-    return moving_target_world_position(prompt, step * dt)
-
-
-def _overlay_status(frame_bgr: np.ndarray, detection: Detection, telemetry: ServoTelemetry, title: str) -> np.ndarray:
-    img = frame_bgr.copy()
-    h, w = img.shape[:2]
-    if detection.success:
-        x1, y1, x2, y2 = detection.bbox_xyxy.astype(int)
-        cv2.rectangle(img, (max(0, x1), max(0, y1)), (min(w - 1, x2), min(h - 1, y2)), (0, 255, 0), 2)
-        cv2.circle(img, tuple(np.asarray(detection.centroid_px, dtype=int)), 4, (0, 0, 255), -1)
-    cv2.putText(img, title, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(
-        img,
-        f"backend={telemetry.backend} score={telemetry.detection_score:.2f} feat={telemetry.feature_error_px:.1f}px dist={telemetry.target_distance_m:.3f}m stand={telemetry.standoff_error_m:.3f}m",
-        (12, 52),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
-    return img
-
-
-def _make_writer(path: Path, frame_size: tuple[int, int], fps: float = 30.0):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    return cv2.VideoWriter(str(path), fourcc, fps, frame_size)
-
-
-def _resolve_output_dir(settings: AppSettings) -> Path:
-    if settings.output_dir.is_absolute():
-        return settings.output_dir
-    return project_root() / settings.output_dir
-
-
-def _camera_pose_for_real_mode() -> CameraPose:
-    return canonical_camera_pose()
-
-
-def _camera_intrinsics_for_frame(frame: np.ndarray) -> CameraIntrinsics:
-    h, w = frame.shape[:2]
-    return CameraIntrinsics(fx=0.92 * w, fy=0.92 * w, cx=w / 2.0, cy=h / 2.0, width=w, height=h)
-
-
-def _world_view_lookat(prompt: str) -> tuple[float, float, float]:
-    target = np.asarray(target_world_position(prompt), dtype=float)
-    return float(target[0]), float(target[1]), float(target[2] + 0.18)
-
-
-def _can_use_mujoco_renderer() -> bool:
-    forced = os.getenv("MUJOCO_SERVO_FORCE_RENDERER", "").strip().lower()
-    if forced in {"1", "true", "yes", "on"}:
-        return True
-    if sys.platform == "darwin":
-        return Path(sys.executable).name == "mjpython"
-    return True
-
-
-def _vision_config(settings: AppSettings) -> GroundedSam2Config | None:
-    normalized = settings.backend.strip().lower()
-    if normalized in {"grounded-sam2", "grounded_sam2", "open-vocab", "open_vocab", "auto"}:
-        return GroundedSam2Config.from_preset(settings.vision_preset)
-    return None
-
-
-def _hold_control(model: mujoco.MjModel, data: mujoco.MjData, prompt: str, backend: str, step: int, ee_body_name: str, detection_score: float) -> tuple[np.ndarray, ServoTelemetry]:
-    ee_pos, ee_rot = body_pose_world(model, data, ee_body_name)
-    qpos = np.array(data.qpos.copy(), dtype=float)
-    telemetry = ServoTelemetry(
-        step=step,
-        prompt=prompt,
-        backend=backend,
-        qpos=qpos.copy(),
-        qvel=np.zeros(model.nv, dtype=float),
-        ee_position_m=ee_pos.copy(),
-        ee_orientation_wxyz=rotation_matrix_to_quaternion_wxyz(ee_rot),
-        target_position_m=ee_pos.copy(),
-        position_error_m=0.0,
-        orientation_error_rad=0.0,
-        detection_score=float(detection_score),
-    )
-    return qpos, telemetry
-
-
-def run_simulation(settings: AppSettings, stop_event: Optional[threading.Event] = None) -> dict:
-    output_dir = _resolve_output_dir(settings)
-    robot_spec = build_robot_spec(prefer_reference=settings.use_reference_robot, scene_path=settings.robot_scene_path)
-    bundle = build_scene_bundle(robot_spec, settings.prompt, settings.camera_width, settings.camera_height)
-    model, data = bundle.model, bundle.data
-    target_proto = bundle.target_proto
-    ee_start_pos, _ = body_pose_world(model, data, bundle.ee_body_name)
-    dt = 1.0 / settings.control_rate_hz
-    gains = ServoGains()
-    state = _LoopState()
-    trace: list[dict] = []
-    need_renderer = (settings.show_view or settings.record or settings.backend.strip().lower() not in {"oracle", "simulation", "sim"})
-    can_render = need_renderer and _can_use_mujoco_renderer()
-    world_renderer = None
-    follow_renderer = None
-    sensor_renderer = None
-    viewer_session = None
-    writer = None
-    if can_render:
-        try:
-            world_renderer = MujocoSceneRenderer(
-                model,
-                width=settings.robot_view_width,
-                height=settings.robot_view_height,
-                lookat=_world_view_lookat(settings.prompt),
-                distance=2.9,
-                azimuth=126.0,
-                elevation=-20.0,
-            )
-            follow_renderer = MujocoSceneRenderer(
-                model,
-                width=settings.robot_view_width,
-                height=settings.robot_view_height,
-                lookat=_tracking_lookat(ee_start_pos, target_world_position(settings.prompt)),
-                distance=1.65,
-                azimuth=150.0,
-                elevation=-16.0,
-            )
-            sensor_renderer = MujocoSceneRenderer(
-                model,
-                width=settings.camera_width,
-                height=settings.camera_height,
-                lookat=_camera_panel_lookat(settings.prompt, target_world_position(settings.prompt)),
-                distance=1.45,
-                azimuth=138.0,
-                elevation=-18.0,
-            )
-        except Exception as exc:  # noqa: BLE001
-            warnings.warn(f"Robot-view renderer unavailable, falling back to oracle-style simulation: {exc}", RuntimeWarning)
-            world_renderer = None
-            follow_renderer = None
-            sensor_renderer = None
-    if settings.show_view and threading.current_thread() is threading.main_thread() and _can_use_mujoco_renderer():
-        try:
-            viewer_session = MujocoViewerSession(
-                model,
-                data,
-                lookat=_world_view_lookat(settings.prompt),
-                distance=2.9,
-                azimuth=126.0,
-                elevation=-20.0,
-            )
-        except Exception:
-            viewer_session = None
-
-    current_target_world = _sim_target_position(settings.prompt, 0, dt)
-    backend_name = settings.backend.strip().lower()
-    if sensor_renderer is None and backend_name not in {"oracle", "simulation", "sim"}:
-        backend = OracleBackend(lambda _prompt: current_target_world.copy())
+def _generate_target_path(cfg: AppConfig, motion_time_s: float, moving: bool) -> Pose:
+    base = cfg.target_center_m.copy()
+    if moving:
+        amp_x, amp_y = cfg.sim.target_motion_radius_m
+        center = base + np.array(
+            [
+                amp_x * np.sin(cfg.sim.target_motion_speed * motion_time_s),
+                amp_y * np.sin(cfg.sim.target_motion_speed * 0.8 * motion_time_s),
+                0.0,
+            ],
+            dtype=np.float64,
+        )
     else:
-        backend = build_backend(settings.backend, settings.prompt, lambda _prompt: current_target_world.copy(), config=_vision_config(settings))
-    session = PerceptionSession(backend, settings.prompt)
-    hold_frames = 6
-    limit = settings.max_steps
-    step = 0
-    while step < limit:
-        if stop_event is not None and stop_event.is_set():
-            break
-        current_target_world = _sim_target_position(settings.prompt, step, dt)
-        set_mocap_body_pose(model, data, "target", current_target_world)
-        mujoco.mj_forward(model, data)
-        ee_pos, ee_rot = body_pose_world(model, data, bundle.ee_body_name)
-        if sensor_renderer is not None:
-            sensor_renderer.set_distance(float(np.clip(1.20 + 1.5 * np.linalg.norm(current_target_world - ee_pos), 1.25, 2.3)))
-            sensor_frame = sensor_renderer.render_with_lookat(data, _camera_panel_lookat(settings.prompt, current_target_world))
-        else:
-            sensor_frame = np.zeros((settings.camera_height, settings.camera_width, 3), dtype=np.uint8)
-        raw_detection = session.update(sensor_frame, bundle.camera_intrinsics, bundle.camera_pose)
-        if raw_detection.success:
-            state.missing_frames = 0
-            state.filtered_detection = raw_detection if state.filtered_detection is None else _smooth_detection(state.filtered_detection, raw_detection)
-        else:
-            state.missing_frames += 1
-            if state.missing_frames > hold_frames:
-                state.filtered_detection = None
-        control_detection = state.filtered_detection if state.filtered_detection is not None else raw_detection if raw_detection.success else None
-        if control_detection is None:
-            qpos_cmd, telemetry = _hold_control(
-                model,
-                data,
-                settings.prompt,
-                raw_detection.backend,
-                step,
-                bundle.ee_body_name,
-                raw_detection.score,
-            )
-            state.filtered_qpos = qpos_cmd.copy()
-        else:
-            qpos_cmd, telemetry = compute_servo_command(
-                model=model,
-                data=data,
-                detection=control_detection,
-                prototype=target_proto,
-                camera_intrinsics=bundle.camera_intrinsics,
-                camera_pose=bundle.camera_pose,
-                ee_body_name=bundle.ee_body_name,
-                gains=gains,
-                dt=dt,
-            )
-            state.filtered_qpos = _limit_command(state.filtered_qpos, qpos_cmd, gains.max_joint_delta)
-            qpos_cmd = state.filtered_qpos.copy()
-        telemetry.step = step
-        for i, name in enumerate(bundle.actuator_names[: min(7, model.nu)]):
-            aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-            if aid >= 0:
-                data.ctrl[aid] = qpos_cmd[i]
-        mujoco.mj_step(model, data)
-        ee_pos, ee_rot = body_pose_world(model, data, bundle.ee_body_name)
-        set_mocap_body_pose(model, data, "vision_camera", ee_pos, ee_rot)
-        set_mocap_body_pose(model, data, "vision_target", current_target_world)
-        set_mocap_body_pose(model, data, "vision_ee", ee_pos, ee_rot)
-        mujoco.mj_forward(model, data)
-        world_view = world_renderer.render_with_lookat(data, _world_view_lookat(settings.prompt)) if world_renderer is not None else None
-        if follow_renderer is not None:
-            follow_renderer.set_distance(float(np.clip(1.00 + 1.35 * np.linalg.norm(current_target_world - ee_pos), 1.10, 2.05)))
-            follow_view = follow_renderer.render_with_lookat(data, _tracking_lookat(ee_pos, current_target_world))
-        else:
-            follow_view = None
-        status = "tracking" if raw_detection.success else ("hold" if state.filtered_detection is not None else "searching")
-        annotated_sensor = _overlay_status(
-            sensor_frame,
-            control_detection or raw_detection,
-            telemetry,
-            title=f"sim | auto | {settings.prompt} | {status}",
+        center = base
+    return board_pose_from_center(center, np.array([1.0, 0.0, 0.0], dtype=np.float64))
+
+
+def _arm_joint_targets_from_twist(robot: PandaRobot, twist_world: np.ndarray, damping: float, step_dt: float) -> np.ndarray:
+    jac = robot.body_jacobian(robot.ee_body_name)[:, : len(robot.arm_joint_names)]
+    dq = camera_twist_to_joint_velocity(jac, twist_world, damping=damping)
+    return robot.current_arm_qpos() + dq * float(step_dt)
+
+
+def _save_summary_csv(samples: list[TrackingSample], output_dir: Path) -> None:
+    import csv
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "samples.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time_s", "phase", "position_error_norm", "feature_error_norm", "pixel_error_norm"])
+        for sample in samples:
+            writer.writerow([sample.time_s, sample.phase, sample.position_error_norm, sample.feature_error_norm, sample.pixel_error_norm])
+
+
+def _plot_metrics(samples: list[TrackingSample], output_dir: Path, title: str) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not samples:
+        return
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    times = np.array([s.time_s for s in samples], dtype=np.float64)
+    pos_err = np.array([s.position_error_norm for s in samples], dtype=np.float64)
+    feat_err = np.array([s.feature_error_norm for s in samples], dtype=np.float64)
+    pix_err = np.array([s.pixel_error_norm for s in samples], dtype=np.float64)
+
+    fig, ax = plt.subplots(3, 1, figsize=(9, 9), sharex=True)
+    ax[0].plot(times, pos_err, color="#1f77b4")
+    ax[0].set_ylabel("pos [m]")
+    ax[1].plot(times, feat_err, color="#ff7f0e")
+    ax[1].set_ylabel("feature")
+    ax[2].plot(times, pix_err, color="#2ca02c")
+    ax[2].set_ylabel("pixel")
+    ax[2].set_xlabel("time [s]")
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_dir / f"{title}_metrics.png", dpi=160)
+    plt.close(fig)
+
+
+def _mocap_board_color(board_image: np.ndarray) -> np.ndarray:
+    if board_image.ndim == 2:
+        return cv2.cvtColor(board_image, cv2.COLOR_GRAY2BGR)
+    return board_image
+
+
+def _viewer_status_lines(mode: str, phase: str, prompt: str | None, detection_label: str | None, position_error_norm: float, feature_error_norm: float, joint_positions: np.ndarray | None = None) -> list[str]:
+    lines = [
+        f"mode: {mode}",
+        f"phase: {phase}",
+        "drag mouse to rotate/zoom/pan",
+    ]
+    if prompt:
+        lines.append(f"prompt: {prompt}")
+    if detection_label:
+        lines.append(f"target: {detection_label}")
+    lines.append(f"position error: {position_error_norm:.3f} m")
+    lines.append(f"feature error: {feature_error_norm:.4f}")
+    if joint_positions is not None and len(joint_positions):
+        joints = ", ".join(f"{float(v):+.2f}" for v in np.asarray(joint_positions, dtype=np.float64)[:3])
+        lines.append(f"q[:3]: {joints}")
+    return lines
+
+
+def _workspace_map_extent(radius_xy: tuple[float, float]) -> tuple[float, float]:
+    radius_x = float(abs(radius_xy[0]))
+    radius_y = float(abs(radius_xy[1]))
+    span_x = max(0.90, 2.2 * radius_x + 0.25)
+    span_y = max(0.70, 2.2 * radius_y + 0.25)
+    return span_x, span_y
+
+
+def _preview_panel(image_bgr: np.ndarray, title: str, subtitle: str, info_lines: list[str]) -> np.ndarray:
+    panel = np.asarray(image_bgr, dtype=np.uint8).copy()
+    panel = cv2.copyMakeBorder(panel, 18, 12, 12, 12, cv2.BORDER_CONSTANT, value=(26, 26, 30))
+    cv2.rectangle(panel, (0, 0), (panel.shape[1] - 1, panel.shape[0] - 1), (235, 235, 235), 1, cv2.LINE_AA)
+    cv2.rectangle(panel, (0, 0), (panel.shape[1] - 1, 38), (34, 38, 48), -1)
+    cv2.putText(panel, title, (14, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (245, 245, 245), 2, cv2.LINE_AA)
+    if subtitle:
+        cv2.putText(panel, subtitle, (14, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
+    y = 74
+    for line in info_lines:
+        cv2.putText(panel, line, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (245, 245, 245), 1, cv2.LINE_AA)
+        y += 20
+    return panel
+
+
+def _launch_viewer_if_available(model: mujoco.MjModel, data: mujoco.MjData, *, task: str, live_mode: bool) -> object | None:
+    try:
+        lookat, distance, azimuth, elevation = initial_viewer_pose(task, live_mode=live_mode)
+        return launch_interactive_viewer(
+            model,
+            data,
+            lookat=lookat,
+            distance=distance,
+            azimuth=azimuth,
+            elevation=elevation,
+            show_left_ui=True,
+            show_right_ui=True,
         )
-        footer_lines = [
-            f"backend={backend.name} prompt={settings.prompt} mode=sim control=continuous",
-            f"score={telemetry.detection_score:.2f} feat={telemetry.feature_error_px:.1f}px dist={telemetry.target_distance_m:.3f}m standoff={telemetry.standoff_error_m:.3f}m",
-            "legend: world=full scene | follow=robot-centered | camera=sensor view",
-            "markers: blue=camera | red=target estimate | cyan=ee | orange=object",
-        ]
-        dashboard_frame = three_panel_view(
-            world_view,
-            follow_view,
-            annotated_sensor,
-            layout=ViewLayout(world_title="MuJoCo world", robot_title="Robot follow", camera_title="Sensor / detection"),
-            footer_lines=footer_lines,
+    except Exception as exc:
+        warnings.warn(f"Interactive MuJoCo viewer unavailable, falling back to offscreen preview: {exc}", RuntimeWarning)
+        return None
+
+
+def run_simulation(cfg: AppConfig | None = None, task: str = "t2-fixed", display: bool | None = None) -> RunSummary:
+    cfg = build_default_config() if cfg is None else cfg
+    if display is not None:
+        cfg.sim.display = bool(display)
+    cfg.paths.ensure()
+
+    scene = build_scene(cfg)
+    robot = PandaRobot(scene.model, scene.data)
+    pose_servo = PoseBasedServo(position_gain=cfg.sim.position_gain, orientation_gain=cfg.sim.orientation_gain, damping=cfg.sim.ik_damping)
+    image_servo = ImageBasedServo(gain=cfg.sim.ibvs_gain, damping=cfg.sim.ibvs_damping)
+    viewer_session = _launch_viewer_if_available(scene.model, scene.data, task=task, live_mode=False) if cfg.sim.display else None
+    show_cv2_windows = cfg.sim.display and not running_under_mjpython()
+    world_renderer = None
+    if cfg.sim.render_world and (viewer_session is None or cfg.sim.record_video):
+        try:
+            world_renderer = MuJoCoWorldRenderer(scene.model, cfg.sim.world_camera_height, cfg.sim.world_camera_width, cfg.sim.world_camera_name)
+        except Exception:
+            world_renderer = None
+
+    recorder = None
+    if cfg.sim.record_video:
+        if world_renderer is not None:
+            frame_size = (cfg.sim.world_camera_width, cfg.sim.world_camera_height)
+        else:
+            frame_size = (cfg.camera.width + _PREVIEW_BORDER_X, cfg.camera.height + _PREVIEW_BORDER_Y)
+        recorder = VideoRecorder(cfg.paths.results_dir / f"{task}.mp4", fps=1.0 / cfg.sim.dt, frame_size=frame_size)
+
+    static_target_pose = _generate_target_path(cfg, 0.0, moving=False)
+    target_motion_enabled = False
+    target_motion_start_time_s = 0.0
+    aligned_stable_frames = 0
+    target_pose = static_target_pose
+    robot.set_target_pose(target_pose)
+    mujoco.mj_forward(scene.model, scene.data)
+
+    samples: list[TrackingSample] = []
+    board_bgr = _mocap_board_color(scene.board_image)
+    smoothed_q_target: np.ndarray | None = None
+    target_trail: deque[np.ndarray] = deque(maxlen=24)
+    ee_trail: deque[np.ndarray] = deque(maxlen=24)
+    workspace_center_xy = (float(cfg.target_center_m[0]), float(cfg.target_center_m[1]))
+    workspace_extent_xy = _workspace_map_extent(cfg.sim.target_motion_radius_m)
+    workspace_plane_center = np.array([cfg.target_center_m[0], cfg.target_center_m[1], cfg.sim.target_height_m], dtype=np.float64)
+    workspace_plane_size = np.array([workspace_extent_xy[0], workspace_extent_xy[1], 0.004], dtype=np.float64)
+
+    for step_idx in range(cfg.sim.steps):
+        sim_time_s = step_idx * cfg.sim.dt
+        if target_motion_enabled:
+            motion_time_s = max(0.0, sim_time_s - target_motion_start_time_s)
+            target_pose = _generate_target_path(cfg, motion_time_s, moving=True)
+        else:
+            target_pose = static_target_pose
+        robot.set_target_pose(target_pose)
+        mujoco.mj_forward(scene.model, scene.data)
+
+        ee_pose = robot.current_ee_pose()
+        desired_camera_pose = _desired_camera_pose_for_target(target_pose, cfg.sim.target_offset_m)
+        desired_hand_pose = _desired_hand_pose_for_target(target_pose, cfg.sim.target_offset_m, cfg.eye_camera_offset)
+        current_camera_pose = ee_pose
+
+        current_view, current_points_px = synthesize_board_view(
+            board_texture_bgr=board_bgr,
+            board_pose=target_pose,
+            camera_pose=current_camera_pose,
+            intrinsics=cfg.camera,
+            board_width_m=cfg.board.width_m,
+            board_height_m=cfg.board.height_m,
         )
-        if settings.record and writer is None:
-            writer = _make_writer(output_dir / "sim_dashboard.mp4", (dashboard_frame.shape[1], dashboard_frame.shape[0]), settings.control_rate_hz)
-        if writer is not None:
-            writer.write(dashboard_frame)
+        _desired_view, desired_points_px = synthesize_board_view(
+            board_texture_bgr=board_bgr,
+            board_pose=target_pose,
+            camera_pose=desired_camera_pose,
+            intrinsics=cfg.camera,
+            board_width_m=cfg.board.width_m,
+            board_height_m=cfg.board.height_m,
+        )
+
+        if task in {"t2-fixed", "t2-eye"}:
+            twist_world = pose_servo.camera_twist(ee_pose, desired_hand_pose)
+            q_target = _arm_joint_targets_from_twist(robot, twist_world, cfg.sim.ik_damping, cfg.sim.dt)
+        elif task == "t3-ibvs":
+            depth_est = max(0.25, float(np.linalg.norm(desired_camera_pose.position - target_pose.position)))
+            camera_twist = image_servo.camera_twist(current_points_px, desired_points_px, cfg.camera, depth=depth_est)
+            twist_world = np.concatenate(
+                [
+                    current_camera_pose.rotation @ camera_twist[:3],
+                    current_camera_pose.rotation @ camera_twist[3:],
+                ]
+            )
+            q_target = _arm_joint_targets_from_twist(robot, twist_world, cfg.sim.ik_damping, cfg.sim.dt)
+        else:
+            raise ValueError(f"Unknown simulation task '{task}'.")
+
+        q_target = _lowpass_vector(
+            smoothed_q_target,
+            q_target,
+            cfg.sim.joint_target_smoothing_alpha,
+            cfg.sim.joint_target_max_step_rad,
+        )
+        smoothed_q_target = q_target
+        robot.apply_joint_targets(q_target, gripper_ctrl=cfg.sim.gripper_ctrl)
+        mujoco.mj_step(scene.model, scene.data)
+
+        ee_pose = robot.current_ee_pose()
+        position_error_norm = float(np.linalg.norm(ee_pose.position - desired_hand_pose.position))
+        pixel_error_norm = float(np.linalg.norm(current_points_px - desired_points_px))
+        feature_error_norm = board_feature_error(current_points_px, desired_points_px, cfg.camera)
+        target_trail.append(target_pose.position.copy())
+        ee_trail.append(ee_pose.position.copy())
+        if not target_motion_enabled:
+            aligned = position_error_norm < cfg.sim.align_position_threshold_m and feature_error_norm < cfg.sim.align_feature_threshold
+            if aligned:
+                aligned_stable_frames += 1
+            else:
+                aligned_stable_frames = 0
+            if aligned_stable_frames >= cfg.sim.align_hold_frames or step_idx >= cfg.sim.align_timeout_frames:
+                target_motion_enabled = True
+                target_motion_start_time_s = sim_time_s + cfg.sim.dt
+                aligned_stable_frames = 0
+        phase = "tracking" if target_motion_enabled else "aligning"
+        samples.append(
+            TrackingSample(
+                time_s=step_idx * cfg.sim.dt,
+                target_pose=target_pose,
+                camera_pose=current_camera_pose,
+                ee_pose=ee_pose,
+                joint_positions=robot.current_arm_qpos(),
+                joint_targets=q_target,
+                phase=phase,
+                pixel_error_norm=pixel_error_norm,
+                position_error_norm=position_error_norm,
+                feature_error_norm=feature_error_norm,
+            )
+        )
+
+        camera_preview = overlay_points(current_view.copy(), desired_points_px, color=(0, 165, 255))
+        camera_preview = overlay_points(camera_preview, current_points_px, color=(0, 255, 0))
+        camera_preview = _preview_panel(
+            camera_preview,
+            "SIM SENSOR VIEW",
+            f"{task} / {samples[-1].time_s:.2f}s",
+            [
+                f"phase: {phase}",
+                f"pos err {position_error_norm:.3f} m",
+                f"feat err {feature_error_norm:.4f}",
+                "green = detected corners",
+                "orange = goal box",
+            ],
+        )
+        map_panel = world_map_panel(
+            list(target_trail),
+            list(ee_trail),
+            current_target=target_pose.position,
+            current_ee=ee_pose.position,
+            center_xy=workspace_center_xy,
+            extent_xy=workspace_extent_xy,
+            phase=phase,
+            position_error_norm=position_error_norm,
+            feature_error_norm=feature_error_norm,
+        )
+
         if viewer_session is not None:
+            viewer_session.set_motion_traces(
+                list(target_trail),
+                list(ee_trail),
+                current_target=target_pose.position,
+                current_ee=ee_pose.position,
+                target_pose=target_pose,
+                ee_pose=ee_pose,
+                workspace_center=workspace_plane_center,
+                workspace_size=workspace_plane_size,
+            )
+            viewer_session.set_status(_viewer_status_lines(f"simulation/{task}", phase, None, "servo target", position_error_norm, feature_error_norm, robot.current_arm_qpos()))
+            viewer_session.set_image_panels([camera_preview, map_panel])
             viewer_session.sync()
             if not viewer_session.is_running():
                 break
-        trace.append(
-            {
-                "step": step,
-                "backend": raw_detection.backend,
-                "position_error_m": telemetry.position_error_m,
-                "standoff_error_m": telemetry.standoff_error_m,
-                "target_distance_m": telemetry.target_distance_m,
-                "orientation_error_rad": telemetry.orientation_error_rad,
-                "feature_error_px": telemetry.feature_error_px,
-                "raw_success": raw_detection.success,
-                "used_hold": bool(not raw_detection.success and state.filtered_detection is None),
-            }
-        )
-        step += 1
+
+        if cfg.sim.display or recorder is not None:
+            world_image = None
+            if world_renderer is not None:
+                world_image = world_renderer.render(scene.data)
+                if world_image.ndim == 3 and world_image.shape[-1] == 3:
+                    world_image = cv2.cvtColor(world_image, cv2.COLOR_RGB2BGR)
+                cv2.putText(world_image, f"{task} t={samples[-1].time_s:.2f}s pos={position_error_norm:.3f}m", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 20), 2, cv2.LINE_AA)
+            if recorder is not None:
+                if world_image is not None:
+                    recorder.write(world_image)
+                else:
+                    recorder.write(camera_preview)
+            if show_cv2_windows:
+                if viewer_session is None and world_image is not None:
+                    cv2.imshow("world", world_image)
+                cv2.imshow("camera", camera_preview)
+                cv2.imshow("map", map_panel)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+
+    if recorder is not None:
+        recorder.close()
+    if viewer_session is not None:
+        viewer_session.close()
     if world_renderer is not None:
         world_renderer.close()
-    if follow_renderer is not None:
-        follow_renderer.close()
-    if sensor_renderer is not None:
-        sensor_renderer.close()
-    if writer is not None:
-        writer.release()
-    if viewer_session is not None:
-        viewer_session.close()
-    summary = {
-        "mode": "sim",
-        "prompt": settings.prompt,
-        "backend": backend.name,
-        "steps": settings.max_steps,
-        "final_position_error_m": trace[-1]["position_error_m"] if trace else None,
-        "final_standoff_error_m": trace[-1]["standoff_error_m"] if trace else None,
-        "final_target_distance_m": trace[-1]["target_distance_m"] if trace else None,
-        "final_orientation_error_rad": trace[-1]["orientation_error_rad"] if trace else None,
-        "final_feature_error_px": trace[-1]["feature_error_px"] if trace else None,
-        "robot": robot_spec.name,
-    }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "sim_summary.json").write_text(json.dumps(summary, indent=2))
-    (output_dir / "sim_trace.json").write_text(json.dumps(trace, indent=2))
-    return summary
+    if show_cv2_windows:
+        cv2.destroyAllWindows()
+
+    result_dir = cfg.paths.results_dir / task
+    plot_dir = cfg.paths.plots_dir / task
+    _save_summary_csv(samples, result_dir)
+    _plot_metrics(samples, plot_dir, task)
+    return RunSummary(name=task, output_dir=result_dir, samples=samples)
 
 
-def run_camera(
-    settings: AppSettings,
-    stop_event: Optional[threading.Event] = None,
-) -> dict:
-    output_dir = _resolve_output_dir(settings)
-    robot_spec = build_robot_spec(prefer_reference=settings.use_reference_robot, scene_path=settings.robot_scene_path)
-    bundle = build_scene_bundle(robot_spec, settings.prompt, settings.camera_width, settings.camera_height)
-    model, data = bundle.model, bundle.data
-    target_proto = bundle.target_proto
-    ee_start_pos, _ = body_pose_world(model, data, bundle.ee_body_name)
-    camera = open_camera(settings.camera_index, width=settings.camera_width, height=settings.camera_height)
-    backend = build_backend(settings.backend, settings.prompt, target_world_position, config=_vision_config(settings))
-    session = PerceptionSession(backend, settings.prompt)
-    gains = ServoGains()
-    dt = 1.0 / settings.control_rate_hz
-    frame_count = 0
-    trace: list[dict] = []
-    writer = None
+def run_live_camera(
+    cfg: AppConfig | None = None,
+    prompt: str | None = None,
+    source: str | None = None,
+    display: bool | None = None,
+    max_frames: int | None = None,
+    capture: VideoCaptureStream | None = None,
+    tracker: OpenVocabularyTracker | None = None,
+    detector: GroundingDinoDetector | None = None,
+    segmenter: Sam2MaskGenerator | None = None,
+) -> RunSummary:
+    cfg = build_default_config() if cfg is None else cfg
+    if prompt is not None:
+        cfg.live.prompt = prompt
+    if source is not None:
+        cfg.live.source = source
+    if display is not None:
+        cfg.live.display = bool(display)
+    cfg.paths.ensure()
+
+    scene = build_scene(cfg)
+    robot = PandaRobot(scene.model, scene.data)
+    pose_servo = PoseBasedServo(position_gain=cfg.sim.position_gain, orientation_gain=cfg.sim.orientation_gain, damping=cfg.sim.ik_damping)
+    viewer_session = _launch_viewer_if_available(scene.model, scene.data, task="live-camera", live_mode=True) if cfg.live.display else None
+    show_cv2_windows = cfg.live.display and not running_under_mjpython()
     world_renderer = None
-    follow_renderer = None
-    viewer_session = None
-    if (settings.show_view or settings.record) and _can_use_mujoco_renderer():
+    if cfg.live.render_world and viewer_session is None:
         try:
-            world_renderer = MujocoSceneRenderer(
-                model,
-                width=settings.robot_view_width,
-                height=settings.robot_view_height,
-                lookat=_world_view_lookat(settings.prompt),
-                distance=2.9,
-                azimuth=126.0,
-                elevation=-20.0,
-            )
-            follow_renderer = MujocoSceneRenderer(
-                model,
-                width=settings.robot_view_width,
-                height=settings.robot_view_height,
-                lookat=_tracking_lookat(ee_start_pos, target_world_position(settings.prompt)),
-                distance=1.65,
-                azimuth=150.0,
-                elevation=-16.0,
-            )
-        except Exception as exc:  # noqa: BLE001
-            warnings.warn(f"Robot-view renderer unavailable in camera mode: {exc}", RuntimeWarning)
-            world_renderer = None
-            follow_renderer = None
-    if settings.show_view and threading.current_thread() is threading.main_thread() and _can_use_mujoco_renderer():
-        try:
-            viewer_session = MujocoViewerSession(
-                model,
-                data,
-                lookat=_world_view_lookat(settings.prompt),
-                distance=2.9,
-                azimuth=126.0,
-                elevation=-20.0,
-            )
+            world_renderer = MuJoCoWorldRenderer(scene.model, cfg.sim.world_camera_height, cfg.sim.world_camera_width, cfg.sim.world_camera_name)
         except Exception:
-            viewer_session = None
+            world_renderer = None
 
-    state = _LoopState()
-    hold_frames = 6
-    try:
-        limit = settings.max_steps if settings.run_mode == "auto" or (not settings.show_view and stop_event is None) else None
-        while limit is None or frame_count < limit:
-            if stop_event is not None and stop_event.is_set():
+    if capture is None:
+        if cfg.live.source == "camera":
+            capture_source: int | str = cfg.live.device_index
+        elif cfg.live.source == "video":
+            if not cfg.live.video_path:
+                raise ValueError("video_path is required when source='video'.")
+            capture_source = cfg.live.video_path
+        else:
+            capture_source = cfg.live.source
+        capture = VideoCaptureStream(capture_source, backend=cfg.live.camera_backend, width=cfg.live.camera_width, height=cfg.live.camera_height)
+
+    if tracker is None:
+        if detector is None:
+            detector = GroundingDinoDetector(model_id=cfg.live.model_id, box_threshold=cfg.live.box_threshold, text_threshold=cfg.live.text_threshold, device=cfg.live.device)
+        if segmenter is None and cfg.live.use_sam2:
+            try:
+                segmenter = Sam2MaskGenerator(model_id=cfg.live.sam_model_id, device=cfg.live.device)
+            except Exception as exc:
+                warnings.warn(f"SAM2 unavailable, continuing with Grounding DINO only: {exc}", RuntimeWarning)
+                segmenter = None
+        tracker = OpenVocabularyTracker(detector=detector, segmenter=segmenter, max_side=cfg.live.inference_max_side)
+    recorder = None
+    if cfg.live.record_video:
+        recorder = VideoRecorder(
+            cfg.paths.results_dir / "live_camera.mp4",
+            fps=30.0,
+            frame_size=(cfg.live.camera_width + _PREVIEW_BORDER_X, cfg.live.camera_height + _PREVIEW_BORDER_Y),
+        )
+
+    samples: list[TrackingSample] = []
+    frame_limit = cfg.live.max_frames if max_frames is None else int(max_frames)
+    idx = 0
+    smoothed_object_world: np.ndarray | None = None
+    smoothed_q_target: np.ndarray | None = None
+    target_trail: deque[np.ndarray] = deque(maxlen=24)
+    ee_trail: deque[np.ndarray] = deque(maxlen=24)
+    detection_streak = 0
+    aligned_stable_frames = 0
+    current_target_world: np.ndarray | None = None
+    workspace_center_xy = (float(cfg.target_center_m[0]), float(cfg.target_center_m[1]))
+    workspace_extent_xy = _workspace_map_extent(cfg.sim.target_motion_radius_m)
+    workspace_plane_center = np.array([cfg.target_center_m[0], cfg.target_center_m[1], cfg.sim.target_height_m], dtype=np.float64)
+    workspace_plane_size = np.array([workspace_extent_xy[0], workspace_extent_xy[1], 0.004], dtype=np.float64)
+    while True:
+        if frame_limit > 0 and idx >= frame_limit:
+            break
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            break
+        frame = maybe_resize(frame, width=cfg.live.camera_width, height=cfg.live.camera_height)
+
+        det = tracker.observe(frame, cfg.live.prompt)
+        current_hand_pose = robot.current_ee_pose()
+        desired_hand_pose = current_hand_pose.copy()
+        current_camera_pose = compose(current_hand_pose, cfg.eye_camera_offset)
+        current_points_px = np.empty((0, 2), dtype=np.float64)
+        desired_points_px = np.empty((0, 2), dtype=np.float64)
+        feature_error_norm = 0.0
+        q_target = robot.current_arm_qpos()
+        phase = "search"
+
+        if det is not None:
+            detection_streak += 1
+            current_box, center_px, area_px = _detection_box_and_center(det)
+            desired_box_size_px = max(48.0, cfg.live.target_box_fraction * float(min(frame.shape[:2])))
+            desired_points_px = centered_box_corners(frame.shape[:2], desired_box_size_px)
+            current_points_px = box_xyxy_to_corners(current_box)
+            try:
+                object_world = _ray_plane_intersection_world(center_px, cfg.fixed_camera_pose, cfg.camera, cfg.sim.target_height_m)
+            except ValueError:
+                desired_area_px = max(1.0, float(desired_box_size_px * desired_box_size_px))
+                depth_est = float(np.clip(cfg.live.tracking_depth_m * np.sqrt(area_px / desired_area_px), 0.20, 2.50))
+                center_cam = _pixel_to_camera_point(center_px, depth_est, cfg.camera)
+                object_world = cfg.fixed_camera_pose.transform_point(center_cam)
+            object_world[2] = cfg.sim.target_height_m
+            object_world = _lowpass_vector(smoothed_object_world, object_world, cfg.live.detection_smoothing_alpha)
+            smoothed_object_world = object_world
+            current_target_world = object_world.copy()
+            target_trail.append(object_world.copy())
+            if detection_streak <= cfg.live.acquire_hold_frames:
+                phase = "acquiring"
+                desired_hand_pose = current_hand_pose.copy()
+                q_target = robot.current_arm_qpos()
+                smoothed_q_target = q_target
+            else:
+                horizontal_offset = current_hand_pose.position - object_world
+                horizontal_offset[2] = 0.0
+                if np.linalg.norm(horizontal_offset) < 1e-6:
+                    horizontal_offset = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                horizontal_offset = normalize(horizontal_offset)
+                desired_camera_pos = object_world + horizontal_offset * cfg.live.standoff_m
+                desired_camera_pos[2] = object_world[2]
+                desired_camera_pose = look_at(desired_camera_pos, object_world, np.array([0.0, 0.0, 1.0], dtype=np.float64))
+                desired_hand_pose = compose(desired_camera_pose, inverse_pose(cfg.eye_camera_offset))
+                camera_twist = pose_servo.camera_twist(current_hand_pose, desired_hand_pose)
+                twist_world = np.concatenate(
+                    [
+                        current_hand_pose.rotation @ camera_twist[:3],
+                        current_hand_pose.rotation @ camera_twist[3:],
+                    ]
+                )
+                q_target = _arm_joint_targets_from_twist(robot, twist_world, cfg.sim.ik_damping, 1.0 / 30.0)
+                q_target = _lowpass_vector(
+                    smoothed_q_target,
+                    q_target,
+                    cfg.live.joint_target_smoothing_alpha,
+                    cfg.live.joint_target_max_step_rad,
+                )
+                smoothed_q_target = q_target
+        else:
+            detection_streak = 0
+            aligned_stable_frames = 0
+            current_target_world = None
+            desired_hand_pose = current_hand_pose.copy()
+            smoothed_q_target = q_target
+
+        if len(current_points_px) and len(desired_points_px):
+            feature_error_norm = board_feature_error(current_points_px, desired_points_px, cfg.camera)
+
+        robot.apply_joint_targets(q_target, gripper_ctrl=cfg.sim.gripper_ctrl)
+        mujoco.mj_step(scene.model, scene.data)
+
+        ee_pose = robot.current_ee_pose()
+        ee_trail.append(ee_pose.position.copy())
+        position_error_norm = float(np.linalg.norm(ee_pose.position - desired_hand_pose.position))
+        if det is None:
+            phase = "search"
+        elif detection_streak <= cfg.live.acquire_hold_frames:
+            phase = "acquiring"
+        else:
+            aligned = position_error_norm < cfg.live.align_position_threshold_m and feature_error_norm < cfg.live.align_feature_threshold
+            if aligned:
+                aligned_stable_frames += 1
+            else:
+                aligned_stable_frames = 0
+            phase = "tracking" if aligned_stable_frames >= cfg.live.align_hold_frames or detection_streak >= cfg.live.align_timeout_frames else "aligning"
+        if viewer_session is not None:
+            viewer_session.set_status(
+                _viewer_status_lines(
+                    "live-camera",
+                    phase,
+                    cfg.live.prompt,
+                    det.label if det is not None else None,
+                    position_error_norm,
+                    feature_error_norm,
+                    robot.current_arm_qpos(),
+                )
+            )
+            if not viewer_session.is_running():
                 break
-            frame = camera.read()
-            intrinsics = _camera_intrinsics_for_frame(frame.image_bgr)
-            camera_pose = _camera_pose_for_real_mode()
-            raw_detection = session.update(frame.image_bgr, intrinsics, camera_pose)
-            if raw_detection.success:
-                state.missing_frames = 0
-                state.filtered_detection = raw_detection if state.filtered_detection is None else _smooth_detection(state.filtered_detection, raw_detection)
-            else:
-                state.missing_frames += 1
-                if state.missing_frames > hold_frames:
-                    state.filtered_detection = None
-            control_detection = state.filtered_detection if state.filtered_detection is not None else raw_detection if raw_detection.success else None
-            if control_detection is None:
-                qpos_cmd, telemetry = _hold_control(
-                    model,
-                    data,
-                    settings.prompt,
-                    raw_detection.backend,
-                    frame_count,
-                    bundle.ee_body_name,
-                    raw_detection.score,
-                )
-                state.filtered_qpos = qpos_cmd.copy()
-            else:
-                qpos_cmd, telemetry = compute_servo_command(
-                    model=model,
-                    data=data,
-                    detection=control_detection,
-                    prototype=target_proto,
-                    camera_intrinsics=intrinsics,
-                    camera_pose=camera_pose,
-                    ee_body_name=bundle.ee_body_name,
-                    gains=gains,
-                    dt=dt,
-                )
-                state.filtered_qpos = _limit_command(state.filtered_qpos, qpos_cmd, gains.max_joint_delta)
-                qpos_cmd = state.filtered_qpos.copy()
-            telemetry.step = frame_count
-            for i, name in enumerate(bundle.actuator_names[: min(7, model.nu)]):
-                aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-                if aid >= 0:
-                    data.ctrl[aid] = qpos_cmd[i]
-            mujoco.mj_step(model, data)
-            ee_pos, ee_rot = body_pose_world(model, data, bundle.ee_body_name)
-            set_mocap_body_pose(model, data, "vision_camera", bundle.camera_pose.translation_m, bundle.camera_pose.rotation_world_from_cam)
-            set_mocap_body_pose(model, data, "vision_target", telemetry.target_position_m)
-            set_mocap_body_pose(model, data, "vision_ee", ee_pos, ee_rot)
-            mujoco.mj_forward(model, data)
-            world_view = world_renderer.render_with_lookat(data, _world_view_lookat(settings.prompt)) if world_renderer is not None else None
-            if follow_renderer is not None:
-                follow_renderer.set_distance(float(np.clip(1.00 + 1.35 * np.linalg.norm(telemetry.target_position_m - ee_pos), 1.10, 2.05)))
-                follow_view = follow_renderer.render_with_lookat(data, _tracking_lookat(ee_pos, telemetry.target_position_m))
-            else:
-                follow_view = None
-            status = "tracking" if raw_detection.success else ("hold" if state.filtered_detection is not None else "searching")
-            annotated = _overlay_status(
-                frame.image_bgr,
-                control_detection or raw_detection,
-                telemetry,
-                title=f"{settings.mode} | {settings.run_mode} | {settings.prompt} | {status}",
+        overlay = overlay_detection(frame, det)
+        if len(current_points_px):
+            overlay = overlay_points(overlay, current_points_px, color=(0, 255, 0))
+        if len(desired_points_px):
+            overlay = overlay_points(overlay, desired_points_px, color=(0, 165, 255))
+        if det is not None and det.mask is not None:
+            overlay = overlay_thumbnail(overlay, mask_thumbnail(det.mask), corner="lower_right", margin=14)
+        overlay = _preview_panel(
+            overlay,
+            "GROUNDING DINO + SAM2",
+            cfg.live.prompt,
+            [
+                f"phase: {phase}",
+                f"pos err {position_error_norm:.3f} m",
+                f"feat err {feature_error_norm:.4f}",
+                f"detection: {det.label if det is not None else 'none'}",
+                "green = detection",
+                "orange = goal box",
+            ],
+        )
+        map_panel = world_map_panel(
+            list(target_trail),
+            list(ee_trail),
+            current_target=current_target_world,
+            current_ee=ee_pose.position,
+            center_xy=workspace_center_xy,
+            extent_xy=workspace_extent_xy,
+            phase=phase,
+            position_error_norm=position_error_norm,
+            feature_error_norm=feature_error_norm,
+        )
+
+        samples.append(
+            TrackingSample(
+                time_s=idx / 30.0,
+                target_pose=desired_hand_pose,
+                camera_pose=current_camera_pose,
+                ee_pose=ee_pose,
+                joint_positions=robot.current_arm_qpos(),
+                joint_targets=q_target,
+                phase=phase,
+                pixel_error_norm=float(np.linalg.norm(current_points_px - desired_points_px)) if len(current_points_px) and len(desired_points_px) else 0.0,
+                position_error_norm=position_error_norm,
+                feature_error_norm=feature_error_norm,
+                detection=det,
             )
-            footer_lines = [
-                f"backend={backend.name} prompt={settings.prompt} mode=camera control=continuous",
-                f"camera={frame.device_index}:{frame.backend_name} score={telemetry.detection_score:.2f} feat={telemetry.feature_error_px:.1f}px dist={telemetry.target_distance_m:.3f}m stand={telemetry.standoff_error_m:.3f}m",
-                "legend: world=full scene | follow=robot-centered | camera=real sensor",
-                "markers: blue=camera | red=target estimate | cyan=ee | orange=object",
-            ]
-            display_frame = three_panel_view(
-                world_view,
-                follow_view,
-                annotated,
-                layout=ViewLayout(world_title="MuJoCo world", robot_title="Robot follow", camera_title="Camera / detection"),
-                footer_lines=footer_lines,
+        )
+
+        if recorder is not None:
+            recorder.write(overlay)
+        if viewer_session is not None:
+            viewer_session.set_motion_traces(
+                list(target_trail),
+                list(ee_trail),
+                current_target=current_target_world,
+                current_ee=ee_pose.position,
+                target_pose=None,
+                ee_pose=ee_pose,
+                workspace_center=workspace_plane_center,
+                workspace_size=workspace_plane_size,
             )
-            if settings.record and writer is None:
-                writer = _make_writer(
-                    output_dir / "camera_dashboard.mp4",
-                    (display_frame.shape[1], display_frame.shape[0]),
-                    settings.control_rate_hz,
-                )
-            if writer is not None:
-                writer.write(display_frame)
-            if viewer_session is not None:
-                viewer_session.sync()
-                if not viewer_session.is_running():
-                    break
-            trace.append(
-                {
-                    "step": frame_count,
-                    "backend": raw_detection.backend,
-                    "score": raw_detection.score,
-                    "position_error_m": telemetry.position_error_m,
-                    "standoff_error_m": telemetry.standoff_error_m,
-                    "target_distance_m": telemetry.target_distance_m,
-                    "orientation_error_rad": telemetry.orientation_error_rad,
-                    "feature_error_px": telemetry.feature_error_px,
-                    "bbox": control_detection.bbox_xyxy.tolist() if control_detection is not None else raw_detection.bbox_xyxy.tolist(),
-                    "raw_success": raw_detection.success,
-                    "used_hold": bool(not raw_detection.success and state.filtered_detection is not None),
-                }
-            )
-            frame_count += 1
-    finally:
-        camera.release()
-        if writer is not None:
-            writer.release()
-        if world_renderer is not None:
-            world_renderer.close()
-        if follow_renderer is not None:
-            follow_renderer.close()
+            viewer_session.set_image_panels([overlay, map_panel])
+            viewer_session.sync()
+        if show_cv2_windows:
+            cv2.imshow("live_camera", overlay)
+            cv2.imshow("world_map", map_panel)
+            if viewer_session is None and world_renderer is not None:
+                world_image = world_renderer.render(scene.data)
+                if world_image.ndim == 3 and world_image.shape[-1] == 3:
+                    world_image = cv2.cvtColor(world_image, cv2.COLOR_RGB2BGR)
+                cv2.imshow("world", world_image)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+        idx += 1
+
+    if capture is not None:
+        capture.close()
+    if recorder is not None:
+        recorder.close()
+    if world_renderer is not None:
+        world_renderer.close()
     if viewer_session is not None:
         viewer_session.close()
-    summary = {
-        "mode": "camera",
-        "prompt": settings.prompt,
-        "backend": backend.name,
-        "frames": frame_count,
-        "final_position_error_m": trace[-1]["position_error_m"] if trace else None,
-        "final_standoff_error_m": trace[-1]["standoff_error_m"] if trace else None,
-        "final_target_distance_m": trace[-1]["target_distance_m"] if trace else None,
-        "final_orientation_error_rad": trace[-1]["orientation_error_rad"] if trace else None,
-        "final_feature_error_px": trace[-1]["feature_error_px"] if trace else None,
-        "camera_index": settings.camera_index,
-        "robot": robot_spec.name,
-        "vision_preset": settings.vision_preset,
-    }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "camera_summary.json").write_text(json.dumps(summary, indent=2))
-    (output_dir / "camera_trace.json").write_text(json.dumps(trace, indent=2))
-    return summary
+    if show_cv2_windows:
+        cv2.destroyAllWindows()
+
+    out_dir = cfg.paths.results_dir / "live_camera"
+    _save_summary_csv(samples, out_dir)
+    _plot_metrics(samples, cfg.paths.plots_dir / "live_camera", "live_camera")
+    return RunSummary(name="live_camera", output_dir=out_dir, samples=samples)
 
 
-def run_gui() -> None:
-    from .gui import launch_gui
+def run_calibration(cfg: AppConfig | None = None, source: str | None = None, frame_count: int = 24) -> tuple[np.ndarray, np.ndarray, float, int]:
+    cfg = build_default_config() if cfg is None else cfg
+    if source is not None:
+        cfg.live.source = source
+    cfg.paths.ensure()
 
-    launch_gui()
+    if cfg.live.source == "camera":
+        capture_source: int | str = cfg.live.device_index
+    elif cfg.live.source == "video":
+        if not cfg.live.video_path:
+            raise ValueError("video_path is required when source='video'.")
+        capture_source = cfg.live.video_path
+    else:
+        capture_source = cfg.live.source
+
+    capture = VideoCaptureStream(capture_source, backend=cfg.live.camera_backend, width=cfg.live.camera_width, height=cfg.live.camera_height)
+    frames: list[np.ndarray] = []
+    tracker = CharucoTracker(cfg.board)
+    for _ in range(frame_count):
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            break
+        frame = maybe_resize(frame, width=cfg.live.camera_width, height=cfg.live.camera_height)
+        frames.append(frame)
+        if cfg.live.display:
+            _, obs = tracker.estimate_pose(frame, cfg.camera)
+            preview = frame.copy()
+            if obs is not None:
+                preview = overlay_points(preview, obs.points_px, color=(0, 255, 0))
+            cv2.imshow("calibration", preview)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+    capture.close()
+    if cfg.live.display:
+        cv2.destroyAllWindows()
+    if not frames:
+        raise RuntimeError("No frames collected for calibration.")
+
+    camera_matrix, distortion, rms, used = calibrate_from_charuco_images(frames, cfg.board, (cfg.live.camera_height, cfg.live.camera_width))
+    out_dir = cfg.paths.calibration_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(out_dir / "camera_calibration.npz", camera_matrix=camera_matrix, distortion=distortion, rms=rms, used=used)
+    return camera_matrix, distortion, rms, used

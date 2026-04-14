@@ -1,13 +1,6 @@
-"""MuJoCo vision-servo package."""
+"""MuJoCo visual servo tracking package."""
 
-from .config import AppSettings, build_settings
-from .runtime import run_simulation, run_camera, run_gui
+__all__ = ["__version__"]
 
-__all__ = [
-    "AppSettings",
-    "build_settings",
-    "run_simulation",
-    "run_camera",
-    "run_gui",
-]
+__version__ = "0.1.0"
 

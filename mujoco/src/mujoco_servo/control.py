@@ -2,179 +2,70 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import mujoco
 import numpy as np
 
-from .geometry import (
-    damped_pseudo_inverse,
-    look_at_rotation,
-    normalize,
-    rotation_matrix_to_axis_angle,
-    rotation_matrix_to_quaternion_wxyz,
-)
-from .image_features import bbox_corners_xyxy, order_corners_clockwise
-from .types import CameraPose, Detection, ServoTelemetry, TargetPrototype
-from .scene import body_pose_world
+from .geometry import dls_solve, interaction_matrix, pose_error
+from .types import CameraIntrinsics, Pose
 
 
 @dataclass(slots=True)
-class ServoGains:
-    feature: float = 1.6
-    position: float = 2.2
-    orientation: float = 1.0
-    damping: float = 0.12
-    max_joint_delta: float = 0.06
+class PoseBasedServo:
+    position_gain: float = 2.8
+    orientation_gain: float = 2.0
+    damping: float = 1e-3
+
+    def camera_twist(self, current: Pose, target: Pose) -> np.ndarray:
+        pos_err, rot_err = pose_error(current, target)
+        twist = np.concatenate([self.position_gain * pos_err, self.orientation_gain * rot_err])
+        return twist
 
 
-def _ee_jacobian(model: mujoco.MjModel, data: mujoco.MjData, body_name: str) -> np.ndarray:
-    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-    if body_id < 0:
-        raise KeyError(f"end-effector body '{body_name}' not found")
-    jacp = np.zeros((3, model.nv), dtype=float)
-    jacr = np.zeros((3, model.nv), dtype=float)
-    mujoco.mj_jacBody(model, data, jacp, jacr, body_id)
-    return np.vstack([jacp, jacr])
+@dataclass(slots=True)
+class ImageBasedServo:
+    gain: float = 0.85
+    damping: float = 1e-3
+
+    def camera_twist(self, current_px: np.ndarray, desired_px: np.ndarray, intrinsics: CameraIntrinsics, depth: np.ndarray | float) -> np.ndarray:
+        current_px = np.asarray(current_px, dtype=np.float64).reshape(-1, 2)
+        desired_px = np.asarray(desired_px, dtype=np.float64).reshape(-1, 2)
+        if current_px.shape != desired_px.shape:
+            raise ValueError("Current and desired image points must have the same shape.")
+        error = np.column_stack([
+            (current_px[:, 0] - desired_px[:, 0]) / intrinsics.fx,
+            (current_px[:, 1] - desired_px[:, 1]) / intrinsics.fy,
+        ]).reshape(-1)
+        jac = interaction_matrix(current_px, depth, intrinsics)
+        twist = -self.gain * dls_solve(jac, error, damping=self.damping)
+        return twist
 
 
-def _desired_target_position(
-    detection: Detection,
-    prototype: TargetPrototype,
-    camera_intrinsics,
-    camera_pose: CameraPose,
-    ee_position: np.ndarray,
-) -> np.ndarray:
-    if detection.target_position_world is not None:
-        return np.asarray(detection.target_position_world, dtype=float)
-    if detection.estimated_distance_m is None:
-        depth = prototype.nominal_standoff_m
-    else:
-        depth = float(detection.estimated_distance_m)
-    u, v = np.asarray(detection.centroid_px, dtype=float).reshape(2)
-    ray_cam = np.array(
+def camera_twist_to_joint_velocity(jacobian: np.ndarray, camera_twist_world: np.ndarray, damping: float = 1e-3) -> np.ndarray:
+    return dls_solve(jacobian, np.asarray(camera_twist_world, dtype=np.float64).reshape(-1), damping=damping)
+
+
+def pose_target_from_board(
+    board_pose: Pose,
+    distance_m: float,
+    world_up: np.ndarray | None = None,
+) -> Pose:
+    if world_up is None:
+        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    board_normal = board_pose.rotation[:, 2]
+    camera_pos = board_pose.position + board_normal * float(distance_m)
+    from .geometry import look_at
+
+    return look_at(camera_pos, board_pose.position, world_up)
+
+
+def board_feature_error(current_points_px: np.ndarray, desired_points_px: np.ndarray, intrinsics: CameraIntrinsics) -> float:
+    current_points_px = np.asarray(current_points_px, dtype=np.float64).reshape(-1, 2)
+    desired_points_px = np.asarray(desired_points_px, dtype=np.float64).reshape(-1, 2)
+    if current_points_px.shape != desired_points_px.shape:
+        raise ValueError("Current and desired board features must have the same shape.")
+    diff = np.column_stack(
         [
-            (u - camera_intrinsics.cx) / camera_intrinsics.fx,
-            (v - camera_intrinsics.cy) / camera_intrinsics.fy,
-            1.0,
-        ],
-        dtype=float,
-    )
-    ray_cam = normalize(ray_cam)
-    point_cam = ray_cam * depth
-    point_world = camera_pose.rotation_world_from_cam @ point_cam + camera_pose.translation_m
-    return point_world
-
-
-def _feature_points_from_detection(detection: Detection) -> np.ndarray:
-    if detection.corners_px is not None:
-        return order_corners_clockwise(detection.corners_px)
-    return bbox_corners_xyxy(detection.bbox_xyxy)
-
-
-def _desired_feature_corners(prototype: TargetPrototype, camera_intrinsics) -> np.ndarray:
-    extent = max(float(prototype.size_m[0]), float(prototype.size_m[1]), float(prototype.size_m[2]), 1e-3)
-    depth = max(float(prototype.nominal_standoff_m), 1e-3)
-    half_extent_px_x = max(16.0, 0.5 * camera_intrinsics.fx * extent / depth)
-    half_extent_px_y = max(16.0, 0.5 * camera_intrinsics.fy * extent / depth)
-    center_x = float(camera_intrinsics.cx)
-    center_y = float(camera_intrinsics.cy)
-    return order_corners_clockwise(
-        np.array(
-            [
-                [center_x - half_extent_px_x, center_y - half_extent_px_y],
-                [center_x + half_extent_px_x, center_y - half_extent_px_y],
-                [center_x + half_extent_px_x, center_y + half_extent_px_y],
-                [center_x - half_extent_px_x, center_y + half_extent_px_y],
-            ],
-            dtype=np.float32,
-        )
-    )
-
-
-def _interaction_matrix(points_px: np.ndarray, depth_m: float, intrinsics) -> np.ndarray:
-    depth = max(float(depth_m), 1e-6)
-    matrix = np.zeros((8, 6), dtype=np.float64)
-    for i, (u, v) in enumerate(np.asarray(points_px, dtype=float).reshape(4, 2)):
-        x = (u - intrinsics.cx) / intrinsics.fx
-        y = (v - intrinsics.cy) / intrinsics.fy
-        matrix[2 * i : 2 * i + 2] = np.array(
-            [
-                [-1.0 / depth, 0.0, x / depth, x * y, -(1.0 + x * x), y],
-                [0.0, -1.0 / depth, y / depth, 1.0 + y * y, -x * y, -x],
-            ],
-            dtype=np.float64,
-        )
-    return matrix
-
-
-def compute_servo_command(
-    model: mujoco.MjModel,
-    data: mujoco.MjData,
-    detection: Detection,
-    prototype: TargetPrototype,
-    camera_intrinsics,
-    camera_pose: CameraPose,
-    ee_body_name: str,
-    gains: ServoGains,
-    dt: float,
-) -> tuple[np.ndarray, ServoTelemetry]:
-    ee_pos, ee_rot = body_pose_world(model, data, ee_body_name)
-    target_pos = _desired_target_position(detection, prototype, camera_intrinsics, camera_pose, ee_pos)
-    current_points = _feature_points_from_detection(detection)
-    desired_points = _desired_feature_corners(prototype, camera_intrinsics)
-    depth = float(detection.estimated_distance_m or prototype.nominal_standoff_m)
-    standoff = float(prototype.nominal_standoff_m)
-    feature_error = np.zeros((8, 1), dtype=np.float64)
-    for i in range(4):
-        feature_error[2 * i] = current_points[i, 0] - desired_points[i, 0]
-        feature_error[2 * i + 1] = current_points[i, 1] - desired_points[i, 1]
-    interaction = _interaction_matrix(current_points, depth, camera_intrinsics)
-    feature_scale = np.tile(np.array([camera_intrinsics.fx, camera_intrinsics.fy], dtype=np.float64), 4).reshape(-1, 1)
-    camera_twist_cam = -gains.feature * damped_pseudo_inverse(interaction, damping=gains.damping) @ (feature_error / feature_scale)
-    camera_twist_cam = np.asarray(camera_twist_cam, dtype=float).reshape(6)
-    camera_twist_world = np.concatenate(
-        [
-            camera_pose.rotation_world_from_cam @ camera_twist_cam[:3],
-            camera_pose.rotation_world_from_cam @ camera_twist_cam[3:],
+            (current_points_px[:, 0] - desired_points_px[:, 0]) / intrinsics.fx,
+            (current_points_px[:, 1] - desired_points_px[:, 1]) / intrinsics.fy,
         ]
     )
-    los = normalize(target_pos - ee_pos)
-    if not np.any(los):
-        los = ee_rot[:, 2]
-    desired_ee_pos = target_pos - los * standoff
-    desired_rot = look_at_rotation(target_pos - desired_ee_pos, np.array([0.0, 0.0, 1.0], dtype=float))
-    pos_error = desired_ee_pos - ee_pos
-    ori_error = rotation_matrix_to_axis_angle(desired_rot @ ee_rot.T)
-    jacobian = _ee_jacobian(model, data, ee_body_name)
-    pose_twist_world = np.concatenate(
-        [
-            gains.position * pos_error,
-            gains.orientation * ori_error,
-        ]
-    )
-    combined_twist_world = pose_twist_world + 0.35 * camera_twist_world
-    qvel = damped_pseudo_inverse(jacobian, damping=gains.damping) @ combined_twist_world
-    qvel = np.asarray(qvel, dtype=float)
-    if qvel.shape[0] > 0:
-        norm = float(np.linalg.norm(qvel))
-        if norm > gains.max_joint_delta / max(dt, 1e-9):
-            qvel = qvel / norm * (gains.max_joint_delta / max(dt, 1e-9))
-    qpos = np.array(data.qpos.copy(), dtype=float)
-    if model.nu >= 7:
-        qpos[:7] = qpos[:7] + qvel[:7] * dt
-    telemetry = ServoTelemetry(
-        step=0,
-        prompt=detection.prompt,
-        backend=detection.backend,
-        qpos=qpos.copy(),
-        qvel=qvel.copy(),
-        ee_position_m=ee_pos.copy(),
-        ee_orientation_wxyz=rotation_matrix_to_quaternion_wxyz(ee_rot),
-        target_position_m=target_pos.copy(),
-        position_error_m=float(np.linalg.norm(pos_error)),
-        orientation_error_rad=float(np.linalg.norm(ori_error)),
-        detection_score=float(detection.score),
-        target_distance_m=float(np.linalg.norm(target_pos - ee_pos)),
-        standoff_error_m=float(np.linalg.norm(target_pos - ee_pos) - standoff),
-        feature_error_px=float(np.linalg.norm(feature_error)),
-    )
-    return qpos, telemetry
+    return float(np.linalg.norm(diff))

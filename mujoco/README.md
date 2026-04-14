@@ -1,93 +1,99 @@
 # MuJoCo Vision Servo
 
-This branch is the Python + MuJoCo rebuild of the vision-servo project.
+Python + MuJoCo reimplementation of the vision servo project.
 
-## What it does
+## What is covered
 
-- Uses Franka Panda from `reference/mujoco_menagerie` when available.
-- Runs a continuous visual-servo loop instead of one-shot detections.
-- Keeps the target moving in simulation so the follow behavior is visible.
-- Uses image-space corners plus a standoff pose target, so the end-effector stays facing the target at roughly 30 cm.
-- Supports simulation and real-camera modes with the same controller.
-- Supports `oracle`, `heuristic`, and `grounded-sam2` perception backends.
-- Shows a three-panel dashboard with the MuJoCo world scene, a robot follow view, and the camera / detection view.
+- Franka Panda simulation using the upstream `reference/mujoco_menagerie/franka_emika_panda` assets
+- position-based visual servoing in simulation
+- eye-in-hand visual servoing in simulation
+- IBVS using four board corners
+- live camera tracking on MacBook camera first
+- open-vocabulary object detection via Grounding DINO tiny/small style models
+- optional SAM2 box-conditioned mask refinement
+- ChArUco calibration and board-based feature extraction
+- a side-on tracking setup where the simulation target moves in a horizontal plane and the robot keeps a readable lateral motion in the viewer
 
-## Perception backends
+## Layout
 
-- `oracle`: deterministic backend for simulation and tests.
-- `heuristic`: prompt-guided classical fallback.
-- `grounded-sam2`: Grounding DINO + SAM 2 when open-vocabulary weights are available.
-
-Vision presets:
-
-- `default`: `IDEA-Research/grounding-dino-base` + `facebook/sam2.1-hiera-base-plus`
-- `small`: `IDEA-Research/grounding-dino-tiny` + `facebook/sam2.1-hiera-small`
-- `lite`: `IDEA-Research/grounding-dino-tiny` + `facebook/sam2.1-hiera-tiny`
-
-If SAM 2 is not available, the backend falls back to a box-mask mode so the controller still runs.
-
-## Install
-
-```bash
-conda run -n mujoco python -m pip install -e .
-```
-
-To enable the open-vocabulary backend:
-
-```bash
-conda run -n mujoco python -m pip install -e ".[open-vocab]"
-```
-
-If you have a local checkout of `reference/Grounded-SAM-2`, the backend can use it automatically. Otherwise set `MUJOCO_SERVO_SAM2_REPO` and `MUJOCO_SERVO_SAM2_CHECKPOINT`.
-
-The first `grounded-sam2` run downloads the Grounding DINO weights and the SAM 2 checkpoint into `mujoco/outputs/hf_cache`.
+- `src/mujoco_servo/`: runtime, control, perception, scene, and CLI
+- `tests/`: focused unit and smoke tests
+- `outputs/`: generated runs, plots, videos, and temporary scene files
 
 ## Run
 
-Simulation smoke test with a moving target:
+Install the package into the `mujoco` Conda environment:
 
 ```bash
-conda run -n mujoco python -m mujoco_servo sim --prompt "cup" --backend oracle --steps 240
+conda run -n mujoco python -m pip install -e ./mujoco
 ```
 
-Simulation with open-vocabulary perception:
+That editable install is the cleanest way to get the `mujoco-servo` command
+and to make code changes visible immediately. If you only want to run the
+source tree without installing it, use:
 
 ```bash
-conda run -n mujoco python -m mujoco_servo sim --prompt "cup" --backend grounded-sam2 --vision-preset lite --steps 240
+conda run -n mujoco bash -lc 'PYTHONPATH=mujoco/src python -m mujoco_servo sim --task t2-fixed'
 ```
 
-Real-camera mode:
+Then run a simulation demo:
 
 ```bash
-mjpython -m mujoco_servo camera --prompt "cup" --backend grounded-sam2 --vision-preset lite --run-mode manual
+conda run -n mujoco mujoco-servo sim --task t2-fixed
 ```
 
-On macOS, use `mjpython` when you want the MuJoCo panels to render in real time. The dashboard shows three panels:
+This opens the standard MuJoCo viewer with mouse drag/zoom/rotate controls.
+On macOS the CLI auto-relaunches under `mjpython` so the viewer works from a
+normal terminal command. The offscreen world render is kept only for fallback
+and recording.
 
-- `MuJoCo world`: full scene view
-- `Robot follow`: zoomed view centered on the end-effector and the target
-- `Camera / detection`: the system camera or the simulated sensor view with detection overlays
-
-Use `--run-mode auto` for a fixed-length run and `--run-mode manual` when you want Start/Stop control from the GUI path.
-
-GUI:
+Run the eye-in-hand simulation:
 
 ```bash
-conda run -n mujoco python -m mujoco_servo gui
+conda run -n mujoco mujoco-servo sim --task t2-eye
 ```
 
-The GUI is a control launcher. The three-panel dashboard is shown by the `sim` and `camera` commands when `--no-view` is not set.
-
-List available cameras:
+Run IBVS in simulation:
 
 ```bash
-conda run -n mujoco python -m mujoco_servo cameras
+conda run -n mujoco mujoco-servo sim --task t3-ibvs
 ```
+
+Run live camera tracking:
+
+```bash
+conda run -n mujoco mujoco-servo camera --source camera --backend avfoundation --prompt "cup"
+```
+
+The live camera mode also opens the standard MuJoCo viewer so you can see the
+robot motion while the object is being tracked. The live controller currently
+uses plane-only tracking on a fixed horizontal workspace, so the arm moves
+laterally instead of diving toward the floor. On macOS the OpenCV preview
+window is suppressed because `cv2.imshow` is not stable under `mjpython`; the
+SAM/DINO detection overlay is shown as a compact image panel inside the
+MuJoCo viewer, including a mask thumbnail when SAM2 returns one, and the same
+overlay is still written to recorded output. The viewer status text also shows
+the current servo phase so the sequence reads as: detection, alignment, then
+tracking.
+
+Run camera calibration:
+
+```bash
+conda run -n mujoco mujoco-servo calibrate --source camera --backend avfoundation
+```
+
+Useful live-camera options:
+
+- `--model-id IDEA-Research/grounding-dino-tiny`
+- `--sam-model-id facebook/sam2.1-hiera-tiny`
+- `--no-sam` to disable SAM2 if you want faster box-only tracking
+- `--inference-max-side 960` to reduce open-vocabulary inference cost
+- `--max-frames 10` for smoke tests or short runs
+
+The live camera path uses the external camera as the visual input and drives the simulated Panda toward the detected object. The object pose is approximate and is driven by the detection box/mask geometry plus a configurable depth proxy, which is enough for a practical visual-servo demo without a real robot arm.
 
 ## Notes
 
-- The controller uses image corners, filtered detections, and a standoff pose target.
-- The simulation target moves continuously so the follow behavior is easy to see.
-- On macOS, camera access still depends on system permission prompts.
-- The dashboard recordings are written as `sim_dashboard.mp4` and `camera_dashboard.mp4` when `--record` is set.
-- If the live camera path is unavailable, the simulation path remains the primary regression test.
+- The Panda XML/MJCF/URDF files under `reference/mujoco_menagerie/franka_emika_panda` are treated as read-only inputs.
+- The simulation scene is assembled in Python by wrapping the upstream Panda model.
+- The live camera path is modular and can be extended to USB cameras and video files.

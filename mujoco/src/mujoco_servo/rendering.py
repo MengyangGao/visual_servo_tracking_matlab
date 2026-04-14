@@ -1,220 +1,307 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import mujoco
-from mujoco import viewer as mujoco_viewer
 import numpy as np
+
+from .geometry import board_corner_points, project_points
+from .types import CameraIntrinsics, Detection, Pose
 
 
 @dataclass(slots=True)
-class ViewLayout:
-    robot_title: str = "MuJoCo follow"
-    camera_title: str = "Real camera"
-    world_title: str = "MuJoCo world"
-    label_scale: float = 0.62
-    label_thickness: int = 2
-    label_color: tuple[int, int, int] = (255, 255, 255)
-    robot_label_color: tuple[int, int, int] = (0, 176, 255)
-    camera_label_color: tuple[int, int, int] = (120, 220, 120)
-    world_label_color: tuple[int, int, int] = (70, 150, 255)
-    panel_height: int = 320
-    gap_width: int = 12
-    footer_height: int = 92
+class VideoRecorder:
+    path: Path
+    fps: float
+    frame_size: tuple[int, int]
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        self.path = Path(self.path)
+        self.writer = None
+        if self.enabled:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self.writer = cv2.VideoWriter(str(self.path), fourcc, float(self.fps), tuple(int(v) for v in self.frame_size))
+
+    def write(self, image_bgr: np.ndarray) -> None:
+        if self.writer is not None:
+            self.writer.write(image_bgr)
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.release()
+            self.writer = None
 
 
-def _ensure_bgr(image: np.ndarray) -> np.ndarray:
-    if image.ndim == 3 and image.shape[2] == 3:
-        return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    return image.copy()
-
-
-def _label_panel(image: np.ndarray, label: str, color: tuple[int, int, int], layout: ViewLayout) -> np.ndarray:
-    canvas = image.copy()
-    cv2.rectangle(canvas, (0, 0), (min(canvas.shape[1] - 1, 270), 36), color, thickness=-1)
-    cv2.putText(
-        canvas,
-        label,
-        (12, 26),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        layout.label_scale,
-        layout.label_color,
-        layout.label_thickness,
-        cv2.LINE_AA,
-    )
+def bgr_canvas(width: int, height: int, color: tuple[int, int, int] = (245, 245, 245)) -> np.ndarray:
+    canvas = np.empty((height, width, 3), dtype=np.uint8)
+    canvas[:] = np.array(color, dtype=np.uint8)
     return canvas
 
 
-def _resize_to_height(image: np.ndarray, target_height: int) -> np.ndarray:
-    if image.shape[0] == target_height:
-        return image.copy()
-    scale = target_height / max(image.shape[0], 1)
-    target_width = max(1, int(round(image.shape[1] * scale)))
-    return cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+def overlay_mask(image_bgr: np.ndarray, mask: np.ndarray | None, color: tuple[int, int, int] = (0, 200, 80), alpha: float = 0.35) -> np.ndarray:
+    if mask is None:
+        return image_bgr
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim != 2:
+        raise ValueError("Mask must be a 2D array.")
+    out = image_bgr.copy()
+    mask_bool = mask_arr > 0
+    if not np.any(mask_bool):
+        return out
+    overlay = np.zeros_like(out)
+    overlay[:, :] = np.array(color, dtype=np.uint8)
+    out[mask_bool] = cv2.addWeighted(out[mask_bool], 1.0 - alpha, overlay[mask_bool], alpha, 0.0)
+    return out
 
 
-def _panel_placeholder(label: str, size: tuple[int, int], color: tuple[int, int, int]) -> np.ndarray:
-    width, height = size
-    canvas = np.full((height, width, 3), 28, dtype=np.uint8)
-    cv2.rectangle(canvas, (0, 0), (width - 1, height - 1), color, thickness=2)
-    cv2.putText(
-        canvas,
-        label,
-        (20, max(42, height // 2 - 12)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        (245, 245, 245),
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        canvas,
-        "renderer unavailable",
-        (20, max(74, height // 2 + 24)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.62,
-        (215, 215, 215),
-        1,
-        cv2.LINE_AA,
-    )
-    return canvas
+def overlay_detection(image_bgr: np.ndarray, detection: Detection | None, color: tuple[int, int, int] = (0, 255, 0)) -> np.ndarray:
+    out = image_bgr.copy()
+    if detection is None:
+        return out
+    if detection.mask is not None:
+        out = overlay_mask(out, detection.mask, color=(0, 180, 90), alpha=0.30)
+    x0, y0, x1, y1 = detection.box.astype(int)
+    cv2.rectangle(out, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
+    label = f"{detection.label} {detection.score:.2f}".strip()
+    cv2.putText(out, label, (x0, max(0, y0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+    return out
 
 
-def side_by_side_view(robot_bgr: np.ndarray, camera_bgr: np.ndarray | None, layout: ViewLayout | None = None) -> np.ndarray:
-    layout = layout or ViewLayout()
-    robot = _label_panel(robot_bgr, layout.robot_title, layout.robot_label_color, layout)
-    if camera_bgr is None:
-        return robot
-    camera = _label_panel(camera_bgr, layout.camera_title, layout.camera_label_color, layout)
-    target_h = max(robot.shape[0], camera.shape[0])
-    if robot.shape[0] != target_h:
-        new_w = int(round(robot.shape[1] * target_h / robot.shape[0]))
-        robot = cv2.resize(robot, (new_w, target_h), interpolation=cv2.INTER_AREA)
-    if camera.shape[0] != target_h:
-        new_w = int(round(camera.shape[1] * target_h / camera.shape[0]))
-        camera = cv2.resize(camera, (new_w, target_h), interpolation=cv2.INTER_AREA)
-    gap = np.full((target_h, 12, 3), 235, dtype=np.uint8)
-    return np.hstack([robot, gap, camera])
+def overlay_points(image_bgr: np.ndarray, points_px: np.ndarray, color: tuple[int, int, int] = (0, 255, 0), closed: bool = True) -> np.ndarray:
+    out = image_bgr.copy()
+    pts = np.asarray(points_px, dtype=np.int32).reshape(-1, 1, 2)
+    if len(pts) == 0:
+        return out
+    if len(pts) > 1:
+        cv2.polylines(out, [pts], closed, color, 2, cv2.LINE_AA)
+    for p in pts.reshape(-1, 2):
+        cv2.circle(out, tuple(int(v) for v in p), 4, color, -1, cv2.LINE_AA)
+    return out
 
 
-def three_panel_view(
-    world_bgr: np.ndarray | None,
-    follow_bgr: np.ndarray | None,
-    camera_bgr: np.ndarray | None,
-    layout: ViewLayout | None = None,
-    footer_lines: list[str] | tuple[str, ...] | None = None,
+def mask_thumbnail(mask: np.ndarray | None, size: tuple[int, int] = (128, 96), label: str = "MASK") -> np.ndarray | None:
+    if mask is None:
+        return None
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim != 2:
+        raise ValueError("Mask thumbnail expects a 2D mask.")
+    thumb_w, thumb_h = int(size[0]), int(size[1])
+    thumb = np.zeros((thumb_h, thumb_w, 3), dtype=np.uint8)
+    thumb[:] = np.array((18, 18, 24), dtype=np.uint8)
+    resized = cv2.resize((mask_arr > 0).astype(np.uint8) * 255, (thumb_w, thumb_h), interpolation=cv2.INTER_NEAREST)
+    thumb[resized > 0] = np.array((0, 200, 90), dtype=np.uint8)
+    cv2.rectangle(thumb, (0, 0), (thumb_w - 1, thumb_h - 1), (240, 240, 240), 1, cv2.LINE_AA)
+    cv2.rectangle(thumb, (0, 0), (thumb_w - 1, 24), (28, 30, 40), -1)
+    cv2.putText(thumb, label, (8, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (250, 250, 250), 1, cv2.LINE_AA)
+    return thumb
+
+
+def overlay_thumbnail(
+    image_bgr: np.ndarray,
+    thumbnail_bgr: np.ndarray | None,
+    *,
+    corner: str = "lower_right",
+    margin: int = 12,
 ) -> np.ndarray:
-    layout = layout or ViewLayout()
-    target_h = layout.panel_height
-
-    world = _panel_placeholder(layout.world_title, (640, target_h), layout.world_label_color) if world_bgr is None else _label_panel(_resize_to_height(world_bgr, target_h), layout.world_title, layout.world_label_color, layout)
-    follow = _panel_placeholder(layout.robot_title, (640, target_h), layout.robot_label_color) if follow_bgr is None else _label_panel(_resize_to_height(follow_bgr, target_h), layout.robot_title, layout.robot_label_color, layout)
-    camera = _panel_placeholder(layout.camera_title, (640, target_h), layout.camera_label_color) if camera_bgr is None else _label_panel(_resize_to_height(camera_bgr, target_h), layout.camera_title, layout.camera_label_color, layout)
-
-    target_h = max(world.shape[0], follow.shape[0], camera.shape[0])
-    if world.shape[0] != target_h:
-        world = _resize_to_height(world, target_h)
-    if follow.shape[0] != target_h:
-        follow = _resize_to_height(follow, target_h)
-    if camera.shape[0] != target_h:
-        camera = _resize_to_height(camera, target_h)
-
-    gap = np.full((target_h, layout.gap_width, 3), 232, dtype=np.uint8)
-    row = np.hstack([world, gap, follow, gap, camera])
-    if not footer_lines:
-        return row
-
-    footer = np.full((layout.footer_height, row.shape[1], 3), 22, dtype=np.uint8)
-    y = 24
-    for idx, line in enumerate(footer_lines):
-        if y >= footer.shape[0] - 8:
-            break
-        cv2.putText(
-            footer,
-            str(line),
-            (16, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (240, 240, 240),
-            1,
-            cv2.LINE_AA,
-        )
-        y += 24
-    return np.vstack([row, footer])
+    if thumbnail_bgr is None:
+        return image_bgr
+    out = image_bgr.copy()
+    thumb = np.asarray(thumbnail_bgr, dtype=np.uint8)
+    if thumb.ndim != 3 or thumb.shape[2] != 3:
+        raise ValueError("Thumbnail must be a BGR image with shape (H, W, 3).")
+    thumb_h, thumb_w = thumb.shape[:2]
+    height, width = out.shape[:2]
+    if corner == "lower_right":
+        x0 = max(0, width - thumb_w - margin)
+        y0 = max(0, height - thumb_h - margin)
+    elif corner == "lower_left":
+        x0 = max(0, margin)
+        y0 = max(0, height - thumb_h - margin)
+    elif corner == "upper_right":
+        x0 = max(0, width - thumb_w - margin)
+        y0 = max(0, margin)
+    elif corner == "upper_left":
+        x0 = max(0, margin)
+        y0 = max(0, margin)
+    else:
+        raise ValueError(f"Unknown thumbnail corner: {corner}")
+    x1 = min(width, x0 + thumb_w)
+    y1 = min(height, y0 + thumb_h)
+    if x1 <= x0 or y1 <= y0:
+        return out
+    out[y0:y1, x0:x1] = thumb[: y1 - y0, : x1 - x0]
+    return out
 
 
-class MujocoSceneRenderer:
-    def __init__(
-        self,
-        model: mujoco.MjModel,
-        width: int = 640,
-        height: int = 480,
-        lookat: tuple[float, float, float] = (0.55, 0.0, 0.25),
-        distance: float = 2.4,
-        azimuth: float = 135.0,
-        elevation: float = -20.0,
-        follow_body_name: str | None = None,
-    ) -> None:
-        self._renderer = mujoco.Renderer(model, height=height, width=width)
-        self._camera = mujoco.MjvCamera()
-        self._camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-        self._camera.lookat[:] = np.array(lookat, dtype=float)
-        self._camera.distance = float(distance)
-        self._camera.azimuth = float(azimuth)
-        self._camera.elevation = float(elevation)
-        self._camera.fixedcamid = -1
-        self._camera.trackbodyid = -1
-        self._follow_body_id = -1
-        if follow_body_name is not None:
-            self._follow_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, follow_body_name)
+def world_map_panel(
+    target_positions: list[np.ndarray] | tuple[np.ndarray, ...] | None,
+    ee_positions: list[np.ndarray] | tuple[np.ndarray, ...] | None,
+    *,
+    current_target: np.ndarray | None = None,
+    current_ee: np.ndarray | None = None,
+    center_xy: tuple[float, float] = (0.34, 0.0),
+    extent_xy: tuple[float, float] = (0.90, 0.70),
+    size: tuple[int, int] = (320, 240),
+    phase: str = "",
+    position_error_norm: float = 0.0,
+    feature_error_norm: float = 0.0,
+    title: str = "TOP-DOWN MAP",
+) -> np.ndarray:
+    width, height = int(size[0]), int(size[1])
+    panel = np.empty((height, width, 3), dtype=np.uint8)
+    panel[:] = np.array((14, 18, 26), dtype=np.uint8)
+
+    margin_x = 18
+    title_h = 28
+    margin_top = title_h + 10
+    margin_bottom = 20
+    margin_y = 16
+    map_left = margin_x
+    map_top = margin_top
+    map_right = width - margin_x
+    map_bottom = height - margin_bottom
+    map_w = max(1, map_right - map_left)
+    map_h = max(1, map_bottom - map_top)
+
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    ex, ey = float(extent_xy[0]), float(extent_xy[1])
+    x0 = cx - 0.5 * ex
+    x1 = cx + 0.5 * ex
+    y0 = cy - 0.5 * ey
+    y1 = cy + 0.5 * ey
+
+    def world_to_px(point_xy: np.ndarray) -> tuple[int, int]:
+        point = np.asarray(point_xy, dtype=np.float64).reshape(2)
+        u = map_left + (point[0] - x0) / max(1e-9, x1 - x0) * map_w
+        v = map_top + (y1 - point[1]) / max(1e-9, y1 - y0) * map_h
+        return int(round(u)), int(round(v))
+
+    # background and frame
+    cv2.rectangle(panel, (0, 0), (width - 1, height - 1), (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.rectangle(panel, (0, 0), (width - 1, title_h), (30, 36, 46), -1)
+    cv2.putText(panel, title, (12, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (245, 245, 245), 2, cv2.LINE_AA)
+
+    # workspace frame
+    tl = (map_left, map_top)
+    br = (map_right, map_bottom)
+    cv2.rectangle(panel, tl, br, (90, 100, 112), 1, cv2.LINE_AA)
+
+    # center axes / grid
+    axis_x = world_to_px(np.array([cx, cy], dtype=np.float64))[0]
+    axis_y = world_to_px(np.array([cx, cy], dtype=np.float64))[1]
+    cv2.line(panel, (axis_x, map_top), (axis_x, map_bottom), (64, 88, 125), 1, cv2.LINE_AA)
+    cv2.line(panel, (map_left, axis_y), (map_right, axis_y), (64, 88, 125), 1, cv2.LINE_AA)
+
+    # axis hints
+    cv2.arrowedLine(panel, (map_left + 10, map_bottom - 10), (map_left + 52, map_bottom - 10), (72, 190, 255), 2, cv2.LINE_AA, tipLength=0.18)
+    cv2.arrowedLine(panel, (map_left + 10, map_bottom - 10), (map_left + 10, map_bottom - 52), (80, 230, 120), 2, cv2.LINE_AA, tipLength=0.18)
+    cv2.putText(panel, "x", (map_left + 56, map_bottom - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (72, 190, 255), 1, cv2.LINE_AA)
+    cv2.putText(panel, "y", (map_left + 2, map_bottom - 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 230, 120), 1, cv2.LINE_AA)
+
+    def draw_trail(points: list[np.ndarray] | tuple[np.ndarray, ...] | None, color: tuple[int, int, int]) -> None:
+        if points is None:
+            return
+        pts = [np.asarray(point, dtype=np.float64).reshape(-1)[:2] for point in points]
+        if len(pts) < 2:
+            return
+        for start, end in zip(pts[:-1], pts[1:]):
+            cv2.line(panel, world_to_px(start), world_to_px(end), color, 2, cv2.LINE_AA)
+
+    draw_trail(target_positions, (0, 165, 255))
+    draw_trail(ee_positions, (255, 210, 80))
+
+    current_target_xy = None if current_target is None else np.asarray(current_target, dtype=np.float64).reshape(-1)[:2]
+    current_ee_xy = None if current_ee is None else np.asarray(current_ee, dtype=np.float64).reshape(-1)[:2]
+    if current_target_xy is None and target_positions:
+        current_target_xy = np.asarray(target_positions[-1], dtype=np.float64).reshape(-1)[:2]
+    if current_ee_xy is None and ee_positions:
+        current_ee_xy = np.asarray(ee_positions[-1], dtype=np.float64).reshape(-1)[:2]
+
+    if current_target_xy is not None and current_ee_xy is not None:
+        cv2.arrowedLine(panel, world_to_px(current_target_xy), world_to_px(current_ee_xy), (80, 80, 255), 3, cv2.LINE_AA, tipLength=0.18)
+
+    if current_target_xy is not None:
+        tx, ty = world_to_px(current_target_xy)
+        cv2.circle(panel, (tx, ty), 6, (0, 165, 255), -1, cv2.LINE_AA)
+        cv2.circle(panel, (tx, ty), 9, (250, 250, 250), 1, cv2.LINE_AA)
+        cv2.putText(panel, "T", (tx + 8, ty - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2, cv2.LINE_AA)
+
+    if current_ee_xy is not None:
+        exy, eyy = world_to_px(current_ee_xy)
+        cv2.circle(panel, (exy, eyy), 7, (255, 210, 80), -1, cv2.LINE_AA)
+        cv2.circle(panel, (exy, eyy), 10, (250, 250, 250), 1, cv2.LINE_AA)
+        cv2.putText(panel, "E", (exy + 8, eyy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 210, 80), 2, cv2.LINE_AA)
+
+    lines = [
+        f"phase: {phase}" if phase else "phase: -",
+        f"pos err {position_error_norm:.3f} m",
+        f"feat err {feature_error_norm:.4f}",
+    ]
+    y = height - 36
+    for line in lines:
+        cv2.putText(panel, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (240, 240, 240), 1, cv2.LINE_AA)
+        y += 16
+
+    return panel
+
+
+def overlay_pose_axes(image_bgr: np.ndarray, points_px: np.ndarray, color: tuple[int, int, int] = (0, 0, 255)) -> np.ndarray:
+    return overlay_points(image_bgr, points_px, color=color, closed=True)
+
+
+def synthesize_board_view(
+    board_texture_bgr: np.ndarray,
+    board_pose: Pose,
+    camera_pose: Pose,
+    intrinsics: CameraIntrinsics,
+    board_width_m: float,
+    board_height_m: float,
+    background_color: tuple[int, int, int] = (244, 244, 244),
+) -> tuple[np.ndarray, np.ndarray]:
+    height, width = intrinsics.height, intrinsics.width
+    canvas = bgr_canvas(width, height, color=background_color)
+    corners_local = board_corner_points(board_width_m, board_height_m)
+    corners_world = (board_pose.rotation @ corners_local.T).T + board_pose.position[None, :]
+    corners_px = project_points(corners_world, intrinsics, camera_pose)
+
+    source = np.array(
+        [
+            [0.0, 0.0],
+            [board_texture_bgr.shape[1] - 1.0, 0.0],
+            [board_texture_bgr.shape[1] - 1.0, board_texture_bgr.shape[0] - 1.0],
+            [0.0, board_texture_bgr.shape[0] - 1.0],
+        ],
+        dtype=np.float32,
+    )
+    destination = corners_px.astype(np.float32)
+    homography = cv2.getPerspectiveTransform(source, destination)
+    warped = cv2.warpPerspective(board_texture_bgr, homography, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    mask = cv2.warpPerspective(
+        np.ones(board_texture_bgr.shape[:2], dtype=np.uint8) * 255,
+        homography,
+        (width, height),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+    canvas[mask > 0] = warped[mask > 0]
+    return canvas, corners_px
+
+
+class MuJoCoWorldRenderer:
+    def __init__(self, model: mujoco.MjModel, height: int, width: int, camera_name: str):
+        self.renderer = mujoco.Renderer(model, height=height, width=width)
+        self.camera_name = camera_name
 
     def render(self, data: mujoco.MjData) -> np.ndarray:
-        return self.render_with_lookat(data, None)
-
-    def render_with_lookat(self, data: mujoco.MjData, lookat: tuple[float, float, float] | None) -> np.ndarray:
-        if lookat is not None:
-            self._camera.lookat[:] = np.array(lookat, dtype=float)
-        elif self._follow_body_id >= 0:
-            self._camera.lookat[:] = np.array(data.xpos[self._follow_body_id], dtype=float)
-        self._renderer.update_scene(data, camera=self._camera)
-        frame = self._renderer.render()
-        return _ensure_bgr(frame)
-
-    def set_lookat(self, lookat: tuple[float, float, float]) -> None:
-        self._camera.lookat[:] = np.array(lookat, dtype=float)
-
-    def set_distance(self, distance: float) -> None:
-        self._camera.distance = float(distance)
+        self.renderer.update_scene(data, camera=self.camera_name)
+        image = self.renderer.render()
+        if image.ndim == 3 and image.shape[-1] == 3:
+            return np.asarray(image, dtype=np.uint8)
+        return np.asarray(image, dtype=np.uint8)
 
     def close(self) -> None:
-        self._renderer.close()
-
-
-class MujocoViewerSession:
-    def __init__(
-        self,
-        model: mujoco.MjModel,
-        data: mujoco.MjData,
-        lookat: tuple[float, float, float] = (0.55, 0.0, 0.25),
-        distance: float = 2.4,
-        azimuth: float = 135.0,
-        elevation: float = -20.0,
-    ) -> None:
-        self._handle = mujoco_viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False)
-        self.set_lookat(lookat)
-        self._handle.cam.distance = float(distance)
-        self._handle.cam.azimuth = float(azimuth)
-        self._handle.cam.elevation = float(elevation)
-
-    def set_lookat(self, lookat: tuple[float, float, float]) -> None:
-        self._handle.cam.lookat[:] = np.array(lookat, dtype=float)
-
-    def sync(self) -> None:
-        self._handle.sync()
-
-    def is_running(self) -> bool:
-        return self._handle.is_running()
-
-    def close(self) -> None:
-        self._handle.close()
+        self.renderer.close()
