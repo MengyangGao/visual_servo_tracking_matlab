@@ -1,11 +1,11 @@
 # Robotics Vision Projects
 
-This repository contains two project lines:
+This repository is an exploration of visual servo tracking, implemented with PUMA560 robotic arm in Matlab, and Franka Panda robotic arm in Mujoco, 
 
-- `matlab/`: the frozen MATLAB deliverable for `Proj.pdf` Part II.
-- `mujoco/`: the MuJoCo + Python rebuild.
+- `matlab/`: the MATLAB implementation, both eye-in-hand and fixed-eye two views.
+- `mujoco/`: the MuJoCo + Python implementation, with general perception tools like grounding dino and grounded sam 2.
 
-## MATLAB deliverable
+## MATLAB
 
 The MATLAB project covers:
 
@@ -70,7 +70,7 @@ To regenerate or modify the board:
 
 Results and logs are generated locally under `matlab/results/`.
 
-## MuJoCo rebuild
+## MuJoCo
 
 The MuJoCo project uses a continuous visual-servo loop with a three-panel dashboard:
 
