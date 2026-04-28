@@ -48,6 +48,8 @@ class VisualServoSimulation:
         self.controller.reset(self.scene.data)
         self._substeps = max(1, int(round((1.0 / config.controller.control_hz) / self.scene.model.opt.timestep)))
         self._renderer = None
+        self._manual_target_offset = np.zeros(3, dtype=float)
+        self._viewer_camera_initialized = False
 
     def run(self) -> RunSummary:
         viewer = None
@@ -66,7 +68,9 @@ class VisualServoSimulation:
         try:
             import mujoco.viewer
 
-            return mujoco.viewer.launch_passive(self.scene.model, self.scene.data)
+            viewer = mujoco.viewer.launch_passive(self.scene.model, self.scene.data, key_callback=self._handle_key)
+            self._initialize_viewer(viewer)
+            return viewer
         except Exception as exc:
             if sys.platform == "darwin":
                 print(f"viewer unavailable ({exc}); retry with `mjpython scripts/demo.py` for the native macOS viewer")
@@ -115,9 +119,12 @@ class VisualServoSimulation:
             if viewer is not None and not viewer.is_running():
                 break
             time_s = float(data.time)
-            target_pos = self.motion.position(time_s)
+            target_pos = self._target_position(time_s)
             set_target_position(model, data, target_pos)
             mujoco.mj_forward(model, data)
+            if viewer is not None:
+                self._apply_viewer_target_drag(viewer, target_pos)
+                target_pos = site_position(model, data, self.scene.target_site_name)
 
             observation = self._render_camera_observation()
             detection = self.perception.detect(observation, target_pos, self.target, self.config.target)
@@ -133,11 +140,13 @@ class VisualServoSimulation:
             errors.append(last_state.position_error_m)
 
             for _ in range(self._substeps):
-                set_target_position(model, data, self.motion.position(float(data.time)))
+                if self.config.interactive_target and viewer is not None:
+                    set_target_position(model, data, target_pos)
+                else:
+                    set_target_position(model, data, self._target_position(float(data.time)))
                 mujoco.mj_step(model, data)
 
             if viewer is not None:
-                self._update_viewer_camera(viewer)
                 viewer.sync()
             if self.config.realtime and viewer is not None:
                 expected = (step + 1) / float(self.config.controller.control_hz)
@@ -165,7 +174,12 @@ class VisualServoSimulation:
             max_error_m=float(np.max(errors)),
         )
 
-    def _update_viewer_camera(self, viewer) -> None:
+    def _target_position(self, time_s: float) -> np.ndarray:
+        return self.motion.position(time_s) + self._manual_target_offset
+
+    def _initialize_viewer(self, viewer) -> None:
+        if self._viewer_camera_initialized:
+            return
         target = site_position(self.scene.model, self.scene.data, self.scene.target_site_name)
         ee = frame_position(self.scene.model, self.scene.data, self.scene.ee_frame_type, self.scene.ee_frame_name, self.scene.ee_frame_offset)
         midpoint = 0.55 * target + 0.45 * ee
@@ -173,6 +187,60 @@ class VisualServoSimulation:
         viewer.cam.distance = 1.35
         viewer.cam.azimuth = 132.0
         viewer.cam.elevation = -24.0
+        viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_SELECT] = True
+        viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_PERTOBJ] = True
+        self._select_target_for_perturb(viewer)
+        self._viewer_camera_initialized = True
+
+    def _select_target_for_perturb(self, viewer) -> None:
+        body_id = mujoco.mj_name2id(self.scene.model, mujoco.mjtObj.mjOBJ_BODY, self.scene.target_body_name)
+        if body_id < 0:
+            return
+        viewer.perturb.select = body_id
+        viewer.perturb.active = int(mujoco.mjtPertBit.mjPERT_TRANSLATE)
+        viewer.perturb.active2 = int(mujoco.mjtPertBit.mjPERT_TRANSLATE)
+        viewer.perturb.refpos[:] = site_position(self.scene.model, self.scene.data, self.scene.target_site_name)
+        viewer.perturb.localpos[:] = 0.0
+        viewer.perturb.scale = 0.25
+
+    def _apply_viewer_target_drag(self, viewer, scripted_target: np.ndarray) -> None:
+        if not self.config.interactive_target:
+            return
+        body_id = mujoco.mj_name2id(self.scene.model, mujoco.mjtObj.mjOBJ_BODY, self.scene.target_body_name)
+        if body_id < 0:
+            return
+        mocap_id = int(self.scene.model.body_mocapid[body_id])
+        if mocap_id < 0:
+            return
+        dragged = np.array(self.scene.data.mocap_pos[mocap_id], dtype=float)
+        if np.linalg.norm(dragged - scripted_target) > 1e-6:
+            self._manual_target_offset = dragged - self.motion.position(float(self.scene.data.time))
+        self._select_target_for_perturb(viewer)
+
+    def _handle_key(self, keycode: int) -> None:
+        try:
+            import glfw
+        except Exception:
+            return
+        step = float(self.config.key_step_m)
+        mapping = {
+            glfw.KEY_LEFT: np.array([0.0, step, 0.0], dtype=float),
+            glfw.KEY_RIGHT: np.array([0.0, -step, 0.0], dtype=float),
+            glfw.KEY_UP: np.array([step, 0.0, 0.0], dtype=float),
+            glfw.KEY_DOWN: np.array([-step, 0.0, 0.0], dtype=float),
+            glfw.KEY_PAGE_UP: np.array([0.0, 0.0, step], dtype=float),
+            glfw.KEY_PAGE_DOWN: np.array([0.0, 0.0, -step], dtype=float),
+            glfw.KEY_W: np.array([step, 0.0, 0.0], dtype=float),
+            glfw.KEY_S: np.array([-step, 0.0, 0.0], dtype=float),
+            glfw.KEY_A: np.array([0.0, step, 0.0], dtype=float),
+            glfw.KEY_D: np.array([0.0, -step, 0.0], dtype=float),
+            glfw.KEY_Q: np.array([0.0, 0.0, step], dtype=float),
+            glfw.KEY_E: np.array([0.0, 0.0, -step], dtype=float),
+        }
+        if keycode in mapping:
+            self._manual_target_offset += mapping[keycode]
+        elif keycode in {glfw.KEY_SPACE, getattr(glfw, "KEY_BACKSPACE", -1)}:
+            self._manual_target_offset[:] = 0.0
 
 
 def run_demo(config: DemoConfig) -> RunSummary:

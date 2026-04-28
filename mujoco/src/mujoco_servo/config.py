@@ -68,6 +68,8 @@ class DemoConfig:
     headless: bool = False
     viewer: bool = True
     realtime: bool = True
+    interactive_target: bool = True
+    key_step_m: float = 0.025
     seed: int = 7
     camera: CameraConfig = field(default_factory=CameraConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
