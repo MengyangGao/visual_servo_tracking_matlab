@@ -7,6 +7,8 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[2]
+MENAGERIE_PANDA_XML = ROOT / "vendor" / "mujoco_menagerie" / "franka_emika_panda" / "panda.xml"
+MENAGERIE_PANDA_ASSETS = ROOT / "vendor" / "mujoco_menagerie" / "franka_emika_panda" / "assets"
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,10 @@ def project_root() -> Path:
 
 def default_home_qpos() -> np.ndarray:
     return np.array([0.05, 1.2, 0.0, -1.35, 0.0, 1.75, 0.0], dtype=float)
+
+
+def menagerie_home_qpos() -> np.ndarray:
+    return np.array([0.0, 0.4, 0.0, -1.85, 0.0, 2.25, -0.7853], dtype=float)
 
 
 def available_tasks() -> tuple[str, ...]:

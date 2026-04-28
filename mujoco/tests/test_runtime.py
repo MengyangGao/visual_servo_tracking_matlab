@@ -4,6 +4,7 @@ from ._bootstrap import SRC  # noqa: F401
 
 from mujoco_servo.app import VisualServoSimulation
 from mujoco_servo.config import ControllerConfig, DemoConfig
+from mujoco_servo.scene import frame_position
 
 
 def test_headless_demo_reduces_contact_error() -> None:
@@ -19,7 +20,7 @@ def test_headless_demo_reduces_contact_error() -> None:
     )
     app = VisualServoSimulation(cfg)
     start_target = app.motion.position(0.0)
-    start_ee = app.scene.data.site_xpos[app.scene.model.site("ee_site").id].copy()
+    start_ee = frame_position(app.scene.model, app.scene.data, app.scene.ee_frame_type, app.scene.ee_frame_name, app.scene.ee_frame_offset)
     start_error = float(((start_target - start_ee) ** 2).sum() ** 0.5)
     summary = app.run()
     assert summary.steps == 240

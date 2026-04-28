@@ -10,7 +10,7 @@ import numpy as np
 from .config import DemoConfig
 from .control import ResolvedRateController, ServoState
 from .perception import build_perception
-from .scene import build_scene, set_target_position, site_position
+from .scene import build_scene, frame_position, set_target_position, site_position
 from .targets import TargetMotion, resolve_target
 
 
@@ -38,7 +38,13 @@ class VisualServoSimulation:
         self.scene = build_scene(self.target, config.camera)
         self.motion = TargetMotion(self.target, config.trajectory, config.seed)
         self.perception = build_perception(config.detector)
-        self.controller = ResolvedRateController(self.scene.model, self.scene.ee_site_name, config.controller)
+        self.controller = ResolvedRateController(
+            self.scene.model,
+            self.scene.ee_frame_name,
+            self.scene.ee_frame_type,
+            self.scene.ee_frame_offset,
+            config.controller,
+        )
         self.controller.reset(self.scene.data)
         self._substeps = max(1, int(round((1.0 / config.controller.control_hz) / self.scene.model.opt.timestep)))
         self._renderer = None
@@ -111,7 +117,7 @@ class VisualServoSimulation:
                     time.sleep(min(remaining, 0.02))
 
         if last_state is None:
-            ee = site_position(model, data, self.scene.ee_site_name)
+            ee = frame_position(model, data, self.scene.ee_frame_type, self.scene.ee_frame_name, self.scene.ee_frame_offset)
             target = site_position(model, data, self.scene.target_site_name)
             final_error = float(np.linalg.norm(target - ee))
             errors = [final_error]
@@ -132,7 +138,7 @@ class VisualServoSimulation:
 
     def _update_viewer_camera(self, viewer) -> None:
         target = site_position(self.scene.model, self.scene.data, self.scene.target_site_name)
-        ee = site_position(self.scene.model, self.scene.data, self.scene.ee_site_name)
+        ee = frame_position(self.scene.model, self.scene.data, self.scene.ee_frame_type, self.scene.ee_frame_name, self.scene.ee_frame_offset)
         midpoint = 0.55 * target + 0.45 * ee
         viewer.cam.lookat[:] = midpoint
         viewer.cam.distance = 1.35

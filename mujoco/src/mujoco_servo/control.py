@@ -5,9 +5,9 @@ from dataclasses import dataclass
 import mujoco
 import numpy as np
 
-from .config import ControllerConfig, default_home_qpos
+from .config import ControllerConfig, default_home_qpos, menagerie_home_qpos
 from .math_utils import clamp_norm, damped_pseudo_inverse, normalize
-from .scene import site_position
+from .scene import frame_position
 
 
 @dataclass(slots=True)
@@ -41,11 +41,19 @@ def desired_ee_position(task: str, target_position: np.ndarray, ee_position: np.
 
 
 class ResolvedRateController:
-    def __init__(self, model: mujoco.MjModel, ee_site_name: str, config: ControllerConfig) -> None:
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        ee_frame_name: str,
+        ee_frame_type: str,
+        ee_frame_offset: tuple[float, float, float] | np.ndarray,
+        config: ControllerConfig,
+    ) -> None:
         self.model = model
-        self.ee_site_name = ee_site_name
+        self.ee_frame_name = ee_frame_name
+        self.ee_frame_type = ee_frame_type
+        self.ee_frame_offset = np.asarray(ee_frame_offset, dtype=float).reshape(3)
         self.config = config
-        self._qpos_command = default_home_qpos()
         self._filtered_target: np.ndarray | None = None
         self._joint_ids = [
             mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"joint{i}")
@@ -55,9 +63,21 @@ class ResolvedRateController:
             raise RuntimeError("expected joints joint1..joint7")
         self._qpos_adr = np.array([model.jnt_qposadr[joint_id] for joint_id in self._joint_ids], dtype=int)
         self._dof_adr = np.array([model.jnt_dofadr[joint_id] for joint_id in self._joint_ids], dtype=int)
-        self._site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, ee_site_name)
-        if self._site_id < 0:
-            raise RuntimeError(f"site '{ee_site_name}' not found")
+        self._qpos_home = menagerie_home_qpos() if model.nu > 7 else default_home_qpos()
+        self._qpos_command = self._qpos_home.copy()
+        self._frame_id = self._resolve_frame_id(model, ee_frame_type, ee_frame_name)
+
+    @staticmethod
+    def _resolve_frame_id(model: mujoco.MjModel, frame_type: str, frame_name: str) -> int:
+        if frame_type == "site":
+            frame_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, frame_name)
+        elif frame_type in {"body", "body_point"}:
+            frame_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, frame_name)
+        else:
+            raise ValueError(f"unknown end-effector frame type '{frame_type}'")
+        if frame_id < 0:
+            raise RuntimeError(f"{frame_type} '{frame_name}' not found")
+        return frame_id
 
     def reset(self, data: mujoco.MjData) -> None:
         self._qpos_command = np.array(data.qpos[self._qpos_adr], dtype=float)
@@ -71,18 +91,23 @@ class ResolvedRateController:
             alpha = float(self.config.smooth_target_alpha)
             self._filtered_target = (1.0 - alpha) * self._filtered_target + alpha * target
 
-        ee_pos = site_position(self.model, data, self.ee_site_name)
+        ee_pos = frame_position(self.model, data, self.ee_frame_type, self.ee_frame_name, self.ee_frame_offset)
         desired = desired_ee_position(self.config.task, self._filtered_target, ee_pos, self.config)
         error = desired - ee_pos
         ee_velocity = clamp_norm(float(self.config.position_gain) * error, self.config.max_ee_speed)
 
         jacp = np.zeros((3, self.model.nv), dtype=float)
         jacr = np.zeros((3, self.model.nv), dtype=float)
-        mujoco.mj_jacSite(self.model, data, jacp, jacr, self._site_id)
+        if self.ee_frame_type == "site":
+            mujoco.mj_jacSite(self.model, data, jacp, jacr, self._frame_id)
+        elif self.ee_frame_type == "body_point":
+            mujoco.mj_jac(self.model, data, jacp, jacr, ee_pos, self._frame_id)
+        else:
+            mujoco.mj_jacBody(self.model, data, jacp, jacr, self._frame_id)
         arm_jac = jacp[:, self._dof_adr]
         qvel = damped_pseudo_inverse(arm_jac, self.config.damping) @ ee_velocity
 
-        home_error = default_home_qpos() - np.asarray(data.qpos[self._qpos_adr], dtype=float)
+        home_error = self._qpos_home - np.asarray(data.qpos[self._qpos_adr], dtype=float)
         nullspace = np.eye(7) - damped_pseudo_inverse(arm_jac, self.config.damping) @ arm_jac
         qvel = qvel + 0.18 * (nullspace @ home_error)
         qvel = clamp_norm(qvel, self.config.max_joint_speed)
@@ -95,6 +120,8 @@ class ResolvedRateController:
             lo, hi = self.model.jnt_range[joint_id]
             self._qpos_command[i] = np.clip(self._qpos_command[i], lo + 1e-4, hi - 1e-4)
         data.ctrl[:7] = self._qpos_command
+        if self.model.nu > 7:
+            data.ctrl[7] = 255.0
 
         return ServoState(
             step=step_index,

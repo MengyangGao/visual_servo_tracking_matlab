@@ -6,7 +6,7 @@ from textwrap import dedent
 import mujoco
 import numpy as np
 
-from .config import CameraConfig, default_home_qpos
+from .config import CameraConfig, MENAGERIE_PANDA_ASSETS, MENAGERIE_PANDA_XML, default_home_qpos, menagerie_home_qpos
 from .math_utils import look_at_xyaxes
 from .targets import TargetSpec, base_position
 
@@ -16,7 +16,12 @@ class Scene:
     model: mujoco.MjModel
     data: mujoco.MjData
     target: TargetSpec
+    source: str
+    ee_frame_name: str
+    ee_frame_type: str
+    ee_frame_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
     ee_site_name: str = "ee_site"
+    ee_body_name: str = "hand"
     target_body_name: str = "target"
     target_site_name: str = "target_site"
     camera_name: str = "servo_camera"
@@ -134,15 +139,76 @@ def build_mjcf(target: TargetSpec, camera: CameraConfig) -> str:
     ).strip()
 
 
+def _tracking_worldbody_xml(target: TargetSpec, camera: CameraConfig) -> str:
+    target_pos = base_position(target)
+    camera_pos = np.array(camera.position, dtype=float)
+    camera_lookat = np.array(camera.lookat, dtype=float)
+    x_axis, y_axis = look_at_xyaxes(camera_pos, camera_lookat)
+    xyaxes = " ".join(f"{v:.6f}" for v in np.r_[x_axis, y_axis])
+    target_geom = _target_geom_xml(target)
+    return dedent(
+        f"""
+        <worldbody>
+          <light name="servo_key" pos="0.15 -0.8 1.8" dir="-0.2 0.5 -1" diffuse="0.8 0.8 0.74"/>
+          <geom name="servo_table" type="box" pos="0.48 0 0.18" size="0.45 0.38 0.035" rgba="0.34 0.32 0.28 1"/>
+
+          <body name="camera_marker" pos="{camera_pos[0]:.5f} {camera_pos[1]:.5f} {camera_pos[2]:.5f}">
+            <geom type="box" size="0.045 0.030 0.025" rgba="0.15 0.55 0.95 0.9" contype="0" conaffinity="0"/>
+            <camera name="{camera.name}" pos="0 0 0" xyaxes="{xyaxes}" fovy="{camera.fovy_deg:.3f}"/>
+          </body>
+
+          <body name="target" mocap="true" pos="{target_pos[0]:.5f} {target_pos[1]:.5f} {target_pos[2]:.5f}">
+            {target_geom}
+            <site name="target_site" pos="0 0 0" size="0.012" rgba="1 1 1 1"/>
+          </body>
+        </worldbody>
+        """
+    ).strip()
+
+
+def build_menagerie_mjcf(target: TargetSpec, camera: CameraConfig) -> str:
+    text = MENAGERIE_PANDA_XML.read_text()
+    text = text.replace('meshdir="assets"', f'meshdir="{MENAGERIE_PANDA_ASSETS}"')
+    insertion = "\n" + _tracking_worldbody_xml(target, camera) + "\n"
+    return text.replace("</mujoco>", f"{insertion}</mujoco>", 1)
+
+
 def build_scene(target: TargetSpec, camera: CameraConfig | None = None) -> Scene:
     cam = camera or CameraConfig()
-    model = mujoco.MjModel.from_xml_string(build_mjcf(target, cam))
+    source = "menagerie" if MENAGERIE_PANDA_XML.exists() and MENAGERIE_PANDA_ASSETS.exists() else "procedural"
+    if source == "menagerie":
+        model = mujoco.MjModel.from_xml_string(build_menagerie_mjcf(target, cam))
+        home = menagerie_home_qpos()
+        ee_frame_name = "hand"
+        ee_frame_type = "body_point"
+        ee_frame_offset = (0.0, 0.0, 0.10)
+    else:
+        model = mujoco.MjModel.from_xml_string(build_mjcf(target, cam))
+        home = default_home_qpos()
+        ee_frame_name = "ee_site"
+        ee_frame_type = "site"
+        ee_frame_offset = (0.0, 0.0, 0.0)
     data = mujoco.MjData(model)
     mujoco.mj_resetDataKeyframe(model, data, 0)
-    data.ctrl[:] = default_home_qpos()
+    joint_ids = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"joint{i}") for i in range(1, 8)]
+    for i, joint_id in enumerate(joint_ids):
+        data.qpos[model.jnt_qposadr[joint_id]] = home[i]
+        if i < model.nu:
+            data.ctrl[i] = home[i]
+    if model.nu > 7:
+        data.ctrl[7] = 255.0
     set_target_position(model, data, base_position(target))
     mujoco.mj_forward(model, data)
-    return Scene(model=model, data=data, target=target, camera_name=cam.name)
+    return Scene(
+        model=model,
+        data=data,
+        target=target,
+        source=source,
+        ee_frame_name=ee_frame_name,
+        ee_frame_type=ee_frame_type,
+        ee_frame_offset=ee_frame_offset,
+        camera_name=cam.name,
+    )
 
 
 def set_target_position(model: mujoco.MjModel, data: mujoco.MjData, position: np.ndarray) -> None:
@@ -167,3 +233,25 @@ def body_position(model: mujoco.MjModel, data: mujoco.MjData, body_name: str) ->
     if body_id < 0:
         raise KeyError(f"body '{body_name}' missing")
     return np.array(data.xpos[body_id], dtype=float)
+
+
+def frame_position(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    frame_type: str,
+    frame_name: str,
+    frame_offset: tuple[float, float, float] | np.ndarray | None = None,
+) -> np.ndarray:
+    if frame_type == "site":
+        return site_position(model, data, frame_name)
+    if frame_type in {"body", "body_point"}:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, frame_name)
+        if body_id < 0:
+            raise KeyError(f"body '{frame_name}' missing")
+        position = np.array(data.xpos[body_id], dtype=float)
+        if frame_type == "body_point":
+            offset = np.asarray(frame_offset if frame_offset is not None else (0.0, 0.0, 0.0), dtype=float).reshape(3)
+            rotation = np.array(data.xmat[body_id], dtype=float).reshape(3, 3)
+            position = position + rotation @ offset
+        return position
+    raise ValueError(f"unknown frame type '{frame_type}'")

@@ -2,6 +2,8 @@
 
 Rebuild the `mujoco/` project into a clean MuJoCo visual-servo simulation: a virtual camera observes a modular target object, and a Panda-like 7-DoF robot end-effector smoothly tracks the moving target.
 
+Update: replace the procedural fallback robot as the default with Google DeepMind's official MuJoCo Menagerie Franka Emika Panda model, kept as a git submodule.
+
 # User Value
 
 - Run a direct demo with `python scripts/demo.py` or `mjpython scripts/demo.py`.
@@ -15,12 +17,14 @@ Rebuild the `mujoco/` project into a clean MuJoCo visual-servo simulation: a vir
 - Use the existing conda environment named `visual_servo`.
 - The user explicitly allowed deleting/replacing `src`, `tests`, and `pyproject.toml`.
 - Must support Python 3.10 because `visual_servo` is Python 3.10.
-- Do not rely on unavailable `reference/` assets.
+- Use MuJoCo Menagerie as the preferred robot model source.
+- Keep the procedural arm as a fallback if the submodule is unavailable.
+- [ASSUMPTION] Adding `.gitmodules` at the repository root is acceptable because git submodules require it, even though runtime code remains under `mujoco/`.
 - Keep push/PR out of scope unless the user explicitly approves later.
 
 # Assumptions
 
-- [ASSUMPTION] A self-contained procedural Panda-like arm is acceptable for this stage because no local MuJoCo Menagerie assets exist.
+- [ASSUMPTION] The submodule path should be `mujoco/vendor/mujoco_menagerie` so all model assets stay under `mujoco/`.
 - [ASSUMPTION] The default high-quality demo should use oracle/simulation perception for stable closed-loop behavior, with image-based color segmentation available as a lightweight detector.
 - [ASSUMPTION] Advanced semantic backends such as Grounding DINO / SAM2 should be represented by a pluggable interface and optional dependency path, not required for the base demo.
 - [ASSUMPTION] The first acceptance target is contact tracking: the EE center converges to the target center with a small configurable radius.
@@ -32,6 +36,8 @@ Rebuild the `mujoco/` project into a clean MuJoCo visual-servo simulation: a vir
 - `mujoco/src/mujoco_servo/*`
 - `mujoco/tests/*`
 - `mujoco/plan.md`
+- `mujoco/vendor/mujoco_menagerie`
+- `.gitmodules`
 
 # Steps
 
@@ -69,6 +75,10 @@ Rebuild the `mujoco/` project into a clean MuJoCo visual-servo simulation: a vir
    - prints final metrics
 7. Add tests for scene construction, trajectories, task goals, controller convergence smoke, and detector behavior.
 8. Validate with the `visual_servo` conda env.
+9. Add MuJoCo Menagerie as a submodule at `mujoco/vendor/mujoco_menagerie`.
+10. Load `franka_emika_panda/scene.xml` by default and inject the target, camera, and tracking sites.
+11. Keep the procedural scene builder as fallback for missing submodule/assets.
+12. Extend tests to assert the Menagerie Panda path is used when present.
 
 # Validation
 
@@ -76,16 +86,21 @@ Rebuild the `mujoco/` project into a clean MuJoCo visual-servo simulation: a vir
 - `conda run -n visual_servo python -m pip install -e mujoco`
 - `conda run -n visual_servo pytest mujoco/tests`
 - `conda run -n visual_servo python mujoco/scripts/demo.py --headless --steps 240 --target cup --trajectory circle --task contact`
+- `git submodule status mujoco/vendor/mujoco_menagerie`
 
 # Overlooked Risks Or Edge Cases
 
 1. macOS MuJoCo rendering may require `mjpython`; the runtime must still work headless without viewer rendering.
 2. A procedural arm may have singularities or unreachable target poses; the controller needs damping, velocity limits, and workspace clamping.
 3. Color segmentation can fail when lighting/background changes; oracle must remain the default for a reliable demo and tests.
+4. Menagerie Panda joint/body/site names differ from the procedural model, so controller discovery must be name-based and tested.
+5. Injecting custom world objects into an included Menagerie scene can conflict with duplicate worldbody/default/asset declarations; use a wrapper MJCF include instead of editing upstream XML.
+6. Menagerie actuator types/ranges may differ from the fallback model, so commands must map to named Panda actuators rather than assuming actuator order.
 
 # Risks
 
-- The self-contained robot is Panda-like, not a mesh-accurate Franka Panda.
+- Menagerie is a larger git submodule and increases checkout/update time.
+- The fallback robot remains useful for offline development but should no longer be the default.
 - Installing MuJoCo/OpenCV into `visual_servo` may require network access.
 - Passive viewer validation may need a local GUI run with `mjpython` on macOS.
 

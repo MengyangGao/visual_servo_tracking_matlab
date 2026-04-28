@@ -6,17 +6,19 @@ import mujoco
 from ._bootstrap import SRC  # noqa: F401
 
 from mujoco_servo.config import CameraConfig
-from mujoco_servo.scene import build_scene, site_position
+from mujoco_servo.scene import build_scene, frame_position, site_position
 from mujoco_servo.targets import TargetMotion, resolve_target
 
 
 def test_scene_contains_robot_target_and_camera() -> None:
     scene = build_scene(resolve_target("cup"), CameraConfig())
-    assert scene.model.nu == 7
-    assert mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_SITE, "ee_site") >= 0
+    assert scene.source == "menagerie"
+    assert scene.model.nu >= 7
+    assert mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_BODY, "hand") >= 0
     assert mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_SITE, "target_site") >= 0
     assert mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_CAMERA, "servo_camera") >= 0
-    ee = site_position(scene.model, scene.data, "ee_site")
+    assert scene.ee_frame_type == "body_point"
+    ee = frame_position(scene.model, scene.data, scene.ee_frame_type, scene.ee_frame_name, scene.ee_frame_offset)
     target = site_position(scene.model, scene.data, "target_site")
     assert ee.shape == (3,)
     assert target.shape == (3,)
