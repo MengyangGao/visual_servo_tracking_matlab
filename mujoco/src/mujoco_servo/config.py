@@ -28,10 +28,20 @@ class TargetSpec:
     size: tuple[float, float, float]
     rgba: tuple[float, float, float, float]
     aliases: tuple[str, ...] = ()
+    parts: tuple["TargetPart", ...] = ()
 
     @property
     def radius(self) -> float:
         return 0.5 * max(self.size)
+
+
+@dataclass(frozen=True)
+class TargetPart:
+    shape: str
+    size: tuple[float, float, float]
+    pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    rgba: tuple[float, float, float, float] | None = None
+    quat: tuple[float, float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +54,8 @@ class ControllerConfig:
     max_joint_speed: float = 2.6
     standoff_m: float = 0.16
     align_offset_m: float = 0.0
+    orientation_gain: float = 1.2
+    max_angular_speed: float = 1.0
     smooth_target_alpha: float = 0.55
 
 
@@ -66,7 +78,7 @@ def project_root() -> Path:
 
 
 def default_home_qpos() -> np.ndarray:
-    return np.array([0.05, 1.2, 0.0, -1.35, 0.0, 1.75, 0.0], dtype=float)
+    raise RuntimeError("procedural robot fallback was removed; use MuJoCo Menagerie Panda")
 
 
 def menagerie_home_qpos() -> np.ndarray:
@@ -74,7 +86,7 @@ def menagerie_home_qpos() -> np.ndarray:
 
 
 def available_tasks() -> tuple[str, ...]:
-    return ("contact", "standoff", "align-x", "align-y", "align-z")
+    return ("contact", "standoff", "front-standoff", "align-x", "align-y", "align-z")
 
 
 def available_trajectories() -> tuple[str, ...]:

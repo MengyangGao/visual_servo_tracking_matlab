@@ -16,7 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 semantic = [
   "torch>=2.3",
-  "transformers>=4.40",
+  "transformers>=4.51",
   "Pillow>=10",
 ]
 test = [

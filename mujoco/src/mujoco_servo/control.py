@@ -5,8 +5,8 @@ from dataclasses import dataclass
 import mujoco
 import numpy as np
 
-from .config import ControllerConfig, default_home_qpos, menagerie_home_qpos
-from .math_utils import clamp_norm, damped_pseudo_inverse, normalize
+from .config import ControllerConfig, menagerie_home_qpos
+from .math_utils import clamp_norm, damped_pseudo_inverse, normalize, rotation_error_vector, tool_z_facing_rotation
 from .scene import frame_position
 
 
@@ -19,6 +19,7 @@ class ServoState:
     desired_position: np.ndarray
     position_error_m: float
     target_distance_m: float
+    orientation_error_rad: float
     qpos_command: np.ndarray
 
 
@@ -31,6 +32,12 @@ def desired_ee_position(task: str, target_position: np.ndarray, ee_position: np.
     if mode == "standoff":
         direction = normalize(ee - target, np.array([-1.0, 0.0, 0.0]))
         return target + direction * float(config.standoff_m)
+    if mode == "front-standoff":
+        horizontal = np.array([target[0], target[1], 0.0], dtype=float)
+        direction = normalize(horizontal, np.array([1.0, 0.0, 0.0]))
+        desired = target - direction * float(config.standoff_m)
+        desired[2] = target[2]
+        return desired
     if mode == "align-x":
         return np.array([target[0] + config.align_offset_m, ee[1], ee[2]], dtype=float)
     if mode == "align-y":
@@ -38,6 +45,14 @@ def desired_ee_position(task: str, target_position: np.ndarray, ee_position: np.
     if mode == "align-z":
         return np.array([ee[0], ee[1], target[2] + config.align_offset_m], dtype=float)
     raise ValueError(f"unknown servo task '{task}'")
+
+
+def desired_ee_orientation(task: str, target_position: np.ndarray, desired_position: np.ndarray) -> np.ndarray | None:
+    if task.strip().lower() != "front-standoff":
+        return None
+    forward = np.asarray(target_position, dtype=float).reshape(3) - np.asarray(desired_position, dtype=float).reshape(3)
+    forward[2] = 0.0
+    return tool_z_facing_rotation(forward)
 
 
 class ResolvedRateController:
@@ -63,7 +78,7 @@ class ResolvedRateController:
             raise RuntimeError("expected joints joint1..joint7")
         self._qpos_adr = np.array([model.jnt_qposadr[joint_id] for joint_id in self._joint_ids], dtype=int)
         self._dof_adr = np.array([model.jnt_dofadr[joint_id] for joint_id in self._joint_ids], dtype=int)
-        self._qpos_home = menagerie_home_qpos() if model.nu > 7 else default_home_qpos()
+        self._qpos_home = menagerie_home_qpos()
         self._qpos_command = self._qpos_home.copy()
         self._frame_id = self._resolve_frame_id(model, ee_frame_type, ee_frame_name)
 
@@ -95,6 +110,7 @@ class ResolvedRateController:
         desired = desired_ee_position(self.config.task, self._filtered_target, ee_pos, self.config)
         error = desired - ee_pos
         ee_velocity = clamp_norm(float(self.config.position_gain) * error, self.config.max_ee_speed)
+        desired_rotation = desired_ee_orientation(self.config.task, self._filtered_target, desired)
 
         jacp = np.zeros((3, self.model.nv), dtype=float)
         jacr = np.zeros((3, self.model.nv), dtype=float)
@@ -104,12 +120,27 @@ class ResolvedRateController:
             mujoco.mj_jac(self.model, data, jacp, jacr, ee_pos, self._frame_id)
         else:
             mujoco.mj_jacBody(self.model, data, jacp, jacr, self._frame_id)
-        arm_jac = jacp[:, self._dof_adr]
-        qvel = damped_pseudo_inverse(arm_jac, self.config.damping) @ ee_velocity
+        orientation_error = np.zeros(3, dtype=float)
+        if desired_rotation is not None:
+            current_rotation = self._frame_rotation(data)
+            orientation_error = rotation_error_vector(desired_rotation, current_rotation)
+            angular_velocity = clamp_norm(self.config.orientation_gain * orientation_error, self.config.max_angular_speed)
+            task_jac = jacp[:, self._dof_adr]
+            qvel = damped_pseudo_inverse(task_jac, self.config.damping) @ ee_velocity
+            nullspace = np.eye(7) - damped_pseudo_inverse(task_jac, self.config.damping) @ task_jac
+            orientation_jac = jacr[:, self._dof_adr]
+            correction_jac = orientation_jac @ nullspace
+            correction = damped_pseudo_inverse(correction_jac, self.config.damping) @ (angular_velocity - orientation_jac @ qvel)
+            qvel = qvel + 0.15 * (nullspace @ correction)
+        else:
+            task_jac = jacp[:, self._dof_adr]
+            task_velocity = ee_velocity
+            qvel = damped_pseudo_inverse(task_jac, self.config.damping) @ task_velocity
 
         home_error = self._qpos_home - np.asarray(data.qpos[self._qpos_adr], dtype=float)
-        nullspace = np.eye(7) - damped_pseudo_inverse(arm_jac, self.config.damping) @ arm_jac
-        qvel = qvel + 0.18 * (nullspace @ home_error)
+        nullspace = np.eye(7) - damped_pseudo_inverse(task_jac, self.config.damping) @ task_jac
+        home_gain = 0.03 if desired_rotation is not None else 0.18
+        qvel = qvel + home_gain * (nullspace @ home_error)
         qvel = clamp_norm(qvel, self.config.max_joint_speed)
 
         dt = 1.0 / float(self.config.control_hz)
@@ -131,5 +162,11 @@ class ResolvedRateController:
             desired_position=desired,
             position_error_m=float(np.linalg.norm(error)),
             target_distance_m=float(np.linalg.norm(self._filtered_target - ee_pos)),
+            orientation_error_rad=float(np.linalg.norm(orientation_error)),
             qpos_command=self._qpos_command.copy(),
         )
+
+    def _frame_rotation(self, data: mujoco.MjData) -> np.ndarray:
+        if self.ee_frame_type == "site":
+            return np.array(data.site_xmat[self._frame_id], dtype=float).reshape(3, 3)
+        return np.array(data.xmat[self._frame_id], dtype=float).reshape(3, 3)

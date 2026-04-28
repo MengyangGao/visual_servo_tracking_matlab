@@ -9,7 +9,7 @@ import numpy as np
 
 from .config import DemoConfig
 from .control import ResolvedRateController, ServoState
-from .perception import build_perception
+from .perception import CameraIntrinsics, CameraObservation, build_perception
 from .scene import build_scene, frame_position, set_target_position, site_position
 from .targets import TargetMotion, resolve_target
 
@@ -74,20 +74,42 @@ class VisualServoSimulation:
                 print(f"viewer unavailable ({exc}); continuing headless")
             return None
 
-    def _render_camera_frame(self) -> np.ndarray | None:
+    def _render_camera_observation(self) -> CameraObservation | None:
         if self.perception.name == "oracle":
             return None
         if self._renderer is None:
             self._renderer = mujoco.Renderer(self.scene.model, width=self.config.camera.width, height=self.config.camera.height)
         self._renderer.update_scene(self.scene.data, camera=self.scene.camera_name)
         rgb = self._renderer.render()
-        return rgb[:, :, ::-1].copy()
+        self._renderer.enable_depth_rendering()
+        self._renderer.update_scene(self.scene.data, camera=self.scene.camera_name)
+        depth = self._renderer.render().copy()
+        self._renderer.disable_depth_rendering()
+        cam_id = mujoco.mj_name2id(self.scene.model, mujoco.mjtObj.mjOBJ_CAMERA, self.scene.camera_name)
+        fovy = float(self.scene.model.cam_fovy[cam_id])
+        fy = 0.5 * self.config.camera.height / np.tan(np.deg2rad(fovy) * 0.5)
+        intrinsics = CameraIntrinsics(
+            fx=fy,
+            fy=fy,
+            cx=0.5 * self.config.camera.width,
+            cy=0.5 * self.config.camera.height,
+            width=self.config.camera.width,
+            height=self.config.camera.height,
+        )
+        return CameraObservation(
+            frame_bgr=rgb[:, :, ::-1].copy(),
+            depth_m=depth,
+            intrinsics=intrinsics,
+            camera_position=np.array(self.scene.data.cam_xpos[cam_id], dtype=float),
+            camera_xmat=np.array(self.scene.data.cam_xmat[cam_id], dtype=float).reshape(3, 3),
+        )
 
     def _run_loop(self, viewer) -> RunSummary:
         model = self.scene.model
         data = self.scene.data
         errors: list[float] = []
         last_state: ServoState | None = None
+        last_observed_target: np.ndarray | None = None
         wall_start = time.perf_counter()
         for step in range(self.config.steps):
             if viewer is not None and not viewer.is_running():
@@ -97,9 +119,16 @@ class VisualServoSimulation:
             set_target_position(model, data, target_pos)
             mujoco.mj_forward(model, data)
 
-            frame = self._render_camera_frame()
-            detection = self.perception.detect(frame, target_pos, self.target)
-            command_target = detection.target_position if detection.success and detection.target_position is not None else target_pos
+            observation = self._render_camera_observation()
+            detection = self.perception.detect(observation, target_pos, self.target, self.config.target)
+            if detection.success and detection.target_position is not None:
+                last_observed_target = detection.target_position.copy()
+            if last_observed_target is not None:
+                command_target = last_observed_target
+            elif self.perception.name == "oracle":
+                command_target = target_pos
+            else:
+                command_target = frame_position(model, data, self.scene.ee_frame_type, self.scene.ee_frame_name, self.scene.ee_frame_offset)
             last_state = self.controller.step(data, command_target, time_s, step)
             errors.append(last_state.position_error_m)
 

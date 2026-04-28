@@ -11,7 +11,7 @@ from mujoco_servo.targets import TargetMotion, resolve_target
 
 
 def test_scene_contains_robot_target_and_camera() -> None:
-    scene = build_scene(resolve_target("cup"), CameraConfig())
+    scene = build_scene(resolve_target("hammer"), CameraConfig())
     assert scene.source == "menagerie"
     assert scene.model.nu >= 7
     assert mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_BODY, "hand") >= 0
@@ -24,6 +24,7 @@ def test_scene_contains_robot_target_and_camera() -> None:
     assert target.shape == (3,)
     assert np.isfinite(ee).all()
     assert np.isfinite(target).all()
+    assert mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_GEOM, "target_geom_0") >= 0
 
 
 def test_target_trajectories_are_smooth_and_moving() -> None:

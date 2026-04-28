@@ -4,15 +4,53 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .config import TargetSpec
+from .config import TargetPart, TargetSpec
 
 
 TARGETS: dict[str, TargetSpec] = {
     "cup": TargetSpec("cup", "cylinder", (0.075, 0.075, 0.105), (0.95, 0.32, 0.18, 1.0), ("mug", "red cup")),
-    "apple": TargetSpec("apple", "sphere", (0.075, 0.075, 0.075), (0.9, 0.08, 0.10, 1.0), ("red apple",)),
-    "box": TargetSpec("box", "box", (0.11, 0.085, 0.09), (0.18, 0.45, 0.92, 1.0), ("blue box", "cube")),
+    "apple": TargetSpec("apple", "sphere", (0.075, 0.075, 0.075), (0.9, 0.08, 0.10, 1.0), ("red apple", "fruit")),
+    "box": TargetSpec("box", "box", (0.11, 0.085, 0.09), (0.18, 0.45, 0.92, 1.0), ("blue box", "cube", "block")),
     "bottle": TargetSpec("bottle", "cylinder", (0.052, 0.052, 0.22), (0.10, 0.55, 0.85, 1.0), ("blue bottle",)),
     "phone": TargetSpec("phone", "box", (0.075, 0.014, 0.145), (0.08, 0.08, 0.09, 1.0), ("mobile", "black phone")),
+    "capsule": TargetSpec("capsule", "capsule", (0.045, 0.045, 0.16), (0.55, 0.85, 0.25, 1.0), ("pill", "green capsule")),
+    "sphere": TargetSpec("sphere", "sphere", (0.085, 0.085, 0.085), (0.96, 0.85, 0.18, 1.0), ("ball", "yellow sphere")),
+    "cylinder": TargetSpec("cylinder", "cylinder", (0.075, 0.075, 0.13), (0.55, 0.25, 0.9, 1.0), ("can", "purple cylinder")),
+    "hammer": TargetSpec(
+        "hammer",
+        "compound",
+        (0.18, 0.05, 0.12),
+        (0.45, 0.26, 0.12, 1.0),
+        ("tool", "mallet"),
+        parts=(
+            TargetPart("capsule", (0.018, 0.018, 0.18), pos=(0.0, 0.0, 0.0), rgba=(0.45, 0.26, 0.12, 1.0), quat=(0.7071, 0.0, 0.7071, 0.0)),
+            TargetPart("box", (0.095, 0.040, 0.040), pos=(0.075, 0.0, 0.0), rgba=(0.15, 0.15, 0.16, 1.0)),
+        ),
+    ),
+    "dumbbell": TargetSpec(
+        "dumbbell",
+        "compound",
+        (0.18, 0.055, 0.055),
+        (0.10, 0.70, 0.62, 1.0),
+        ("barbell", "weight"),
+        parts=(
+            TargetPart("capsule", (0.015, 0.015, 0.16), rgba=(0.10, 0.70, 0.62, 1.0), quat=(0.7071, 0.0, 0.7071, 0.0)),
+            TargetPart("sphere", (0.052, 0.052, 0.052), pos=(-0.085, 0.0, 0.0), rgba=(0.08, 0.45, 0.40, 1.0)),
+            TargetPart("sphere", (0.052, 0.052, 0.052), pos=(0.085, 0.0, 0.0), rgba=(0.08, 0.45, 0.40, 1.0)),
+        ),
+    ),
+    "tower": TargetSpec(
+        "tower",
+        "compound",
+        (0.08, 0.08, 0.18),
+        (0.92, 0.55, 0.12, 1.0),
+        ("stack", "stacked blocks"),
+        parts=(
+            TargetPart("box", (0.090, 0.090, 0.045), pos=(0.0, 0.0, -0.045), rgba=(0.90, 0.30, 0.18, 1.0)),
+            TargetPart("box", (0.070, 0.070, 0.045), pos=(0.0, 0.0, 0.000), rgba=(0.18, 0.48, 0.90, 1.0)),
+            TargetPart("box", (0.052, 0.052, 0.045), pos=(0.0, 0.0, 0.045), rgba=(0.95, 0.82, 0.20, 1.0)),
+        ),
+    ),
 }
 
 BASE_POSITIONS: dict[str, np.ndarray] = {
@@ -21,6 +59,12 @@ BASE_POSITIONS: dict[str, np.ndarray] = {
     "box": np.array([0.50, -0.10, 0.34], dtype=float),
     "bottle": np.array([0.43, -0.18, 0.42], dtype=float),
     "phone": np.array([0.52, 0.08, 0.33], dtype=float),
+    "capsule": np.array([0.48, 0.12, 0.35], dtype=float),
+    "sphere": np.array([0.46, -0.12, 0.34], dtype=float),
+    "cylinder": np.array([0.51, 0.00, 0.36], dtype=float),
+    "hammer": np.array([0.50, -0.10, 0.35], dtype=float),
+    "dumbbell": np.array([0.48, 0.12, 0.34], dtype=float),
+    "tower": np.array([0.44, 0.02, 0.40], dtype=float),
 }
 
 
@@ -29,11 +73,12 @@ def resolve_target(name_or_prompt: str) -> TargetSpec:
     for key, spec in TARGETS.items():
         if key in text or any(alias in text for alias in spec.aliases):
             return spec
-    return TARGETS["cup"]
+    safe_name = "_".join(part for part in text.split() if part.isalnum()) or "object"
+    return TargetSpec(safe_name[:32], "box", (0.10, 0.10, 0.10), (0.85, 0.25, 0.25, 1.0), (text,))
 
 
 def base_position(target: TargetSpec) -> np.ndarray:
-    return BASE_POSITIONS.get(target.name, BASE_POSITIONS["cup"]).copy()
+    return BASE_POSITIONS.get(target.name, np.array([0.48, 0.02, 0.35], dtype=float)).copy()
 
 
 @dataclass

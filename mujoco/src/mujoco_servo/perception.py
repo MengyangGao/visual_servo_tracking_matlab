@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -7,6 +8,25 @@ import cv2
 import numpy as np
 
 from .targets import TargetSpec
+
+
+@dataclass(slots=True)
+class CameraIntrinsics:
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    width: int
+    height: int
+
+
+@dataclass(slots=True)
+class CameraObservation:
+    frame_bgr: np.ndarray
+    depth_m: np.ndarray
+    intrinsics: CameraIntrinsics
+    camera_position: np.ndarray
+    camera_xmat: np.ndarray
 
 
 @dataclass(slots=True)
@@ -23,23 +43,62 @@ class Detection:
 class PerceptionBackend(Protocol):
     name: str
 
-    def detect(self, frame_bgr: np.ndarray | None, target_position: np.ndarray, target: TargetSpec) -> Detection:
+    def detect(self, observation: CameraObservation | None, truth_position: np.ndarray, target: TargetSpec, prompt: str) -> Detection:
         ...
+
+
+def _bbox_mask(frame_shape: tuple[int, int, int], bbox_xyxy: np.ndarray) -> np.ndarray:
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = np.asarray(bbox_xyxy, dtype=float).reshape(4)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    left = max(0, min(w - 1, int(np.floor(x1))))
+    top = max(0, min(h - 1, int(np.floor(y1))))
+    right = max(left + 1, min(w, int(np.ceil(x2))))
+    bottom = max(top + 1, min(h, int(np.ceil(y2))))
+    mask[top:bottom, left:right] = 255
+    return mask
+
+
+def _estimate_world_position(observation: CameraObservation, bbox_xyxy: np.ndarray, mask: np.ndarray | None) -> tuple[np.ndarray | None, np.ndarray]:
+    if mask is None:
+        mask = _bbox_mask(observation.frame_bgr.shape, bbox_xyxy)
+    valid = mask > 0
+    depth = np.asarray(observation.depth_m, dtype=float)
+    valid &= np.isfinite(depth)
+    valid &= depth > 0.0
+    if not np.any(valid):
+        x1, y1, x2, y2 = np.asarray(bbox_xyxy, dtype=float).reshape(4)
+        u = 0.5 * (x1 + x2)
+        v = 0.5 * (y1 + y2)
+        sample = depth[max(0, min(depth.shape[0] - 1, int(v))), max(0, min(depth.shape[1] - 1, int(u)))]
+        if not np.isfinite(sample) or sample <= 0.0:
+            return None, mask
+        z = float(sample)
+    else:
+        ys, xs = np.nonzero(valid)
+        u = float(np.mean(xs))
+        v = float(np.mean(ys))
+        z = float(np.median(depth[valid]))
+    intr = observation.intrinsics
+    # MuJoCo/OpenGL camera coordinates: +x right, +y up, camera looks along -z.
+    point_cam = np.array([(u - intr.cx) * z / intr.fx, -(v - intr.cy) * z / intr.fy, -z], dtype=float)
+    return observation.camera_position + observation.camera_xmat @ point_cam, mask
 
 
 class OraclePerception:
     name = "oracle"
 
-    def detect(self, frame_bgr: np.ndarray | None, target_position: np.ndarray, target: TargetSpec) -> Detection:
-        return Detection(success=True, backend=self.name, target_position=np.asarray(target_position, dtype=float).reshape(3).copy(), score=1.0)
+    def detect(self, observation: CameraObservation | None, truth_position: np.ndarray, target: TargetSpec, prompt: str) -> Detection:
+        return Detection(success=True, backend=self.name, target_position=np.asarray(truth_position, dtype=float).reshape(3).copy(), score=1.0)
 
 
 class ColorSegmentationPerception:
     name = "color"
 
-    def detect(self, frame_bgr: np.ndarray | None, target_position: np.ndarray, target: TargetSpec) -> Detection:
-        if frame_bgr is None:
+    def detect(self, observation: CameraObservation | None, truth_position: np.ndarray, target: TargetSpec, prompt: str) -> Detection:
+        if observation is None:
             return Detection(False, self.name, None)
+        frame_bgr = observation.frame_bgr
         rgba = np.array(target.rgba[:3], dtype=float)
         target_bgr = np.array([rgba[2], rgba[1], rgba[0]], dtype=float) * 255.0
         hsv_color = cv2.cvtColor(np.uint8([[target_bgr]]), cv2.COLOR_BGR2HSV)[0, 0]
@@ -59,15 +118,17 @@ class ColorSegmentationPerception:
         if area < 20.0:
             return Detection(False, self.name, None, mask=mask)
         x, y, w, h = cv2.boundingRect(contour)
+        bbox = np.array([x, y, x + w, y + h], dtype=float)
         moments = cv2.moments(contour)
         cx = x + 0.5 * w if abs(moments["m00"]) < 1e-9 else moments["m10"] / moments["m00"]
         cy = y + 0.5 * h if abs(moments["m00"]) < 1e-9 else moments["m01"] / moments["m00"]
+        position, mask = _estimate_world_position(observation, bbox, mask)
         return Detection(
-            success=True,
+            success=position is not None,
             backend=self.name,
-            target_position=np.asarray(target_position, dtype=float).reshape(3).copy(),
+            target_position=position,
             score=min(1.0, area / 2500.0),
-            bbox_xyxy=np.array([x, y, x + w, y + h], dtype=float),
+            bbox_xyxy=bbox,
             centroid_px=np.array([cx, cy], dtype=float),
             mask=mask,
         )
@@ -78,16 +139,78 @@ class SemanticPerception:
 
     def __init__(self) -> None:
         try:
-            import torch  # noqa: F401
-            import transformers  # noqa: F401
+            import torch
+            from PIL import Image
+            from transformers import GroundingDinoForObjectDetection, GroundingDinoProcessor, SamModel, SamProcessor
         except Exception as exc:
             raise RuntimeError(
-                "semantic perception is optional. Install with `pip install -e .[semantic]` "
-                "and configure a Grounding DINO / SAM2 implementation before using --detector semantic."
+                "semantic perception requires optional dependencies. Install with "
+                "`conda run -n visual_servo python -m pip install -e 'mujoco[semantic]'`."
             ) from exc
+        self._torch = torch
+        self._image_cls = Image
+        self._gdino_processor = GroundingDinoProcessor.from_pretrained(os.getenv("MUJOCO_SERVO_GDINO_MODEL", "IDEA-Research/grounding-dino-tiny"))
+        self._gdino_model = GroundingDinoForObjectDetection.from_pretrained(os.getenv("MUJOCO_SERVO_GDINO_MODEL", "IDEA-Research/grounding-dino-tiny"))
+        self._sam_processor = SamProcessor.from_pretrained(os.getenv("MUJOCO_SERVO_SAM_MODEL", "facebook/sam-vit-base"))
+        self._sam_model = SamModel.from_pretrained(os.getenv("MUJOCO_SERVO_SAM_MODEL", "facebook/sam-vit-base"))
+        device = os.getenv("MUJOCO_SERVO_DEVICE", "cpu")
+        if device == "auto":
+            device = "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"
+        self._device = torch.device(device)
+        self._gdino_model.to(self._device).eval()
+        self._sam_model.to(self._device).eval()
+        self._box_threshold = float(os.getenv("MUJOCO_SERVO_GDINO_BOX_THRESHOLD", "0.25"))
+        self._text_threshold = float(os.getenv("MUJOCO_SERVO_GDINO_TEXT_THRESHOLD", "0.25"))
 
-    def detect(self, frame_bgr: np.ndarray | None, target_position: np.ndarray, target: TargetSpec) -> Detection:
-        raise NotImplementedError("semantic detector adapter is intentionally pluggable; oracle/color are ready now")
+    def detect(self, observation: CameraObservation | None, truth_position: np.ndarray, target: TargetSpec, prompt: str) -> Detection:
+        if observation is None:
+            return Detection(False, self.name, None)
+        image = self._image_cls.fromarray(observation.frame_bgr[:, :, ::-1])
+        text = prompt.strip().lower()
+        if not text.endswith("."):
+            text = f"{text}."
+        with self._torch.no_grad():
+            inputs = self._gdino_processor(images=image, text=text, return_tensors="pt").to(self._device)
+            outputs = self._gdino_model(**inputs)
+            results = self._gdino_processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold=self._box_threshold,
+                text_threshold=self._text_threshold,
+                target_sizes=[image.size[::-1]],
+            )[0]
+        boxes = results.get("boxes", [])
+        scores = results.get("scores", [])
+        if len(boxes) == 0:
+            return Detection(False, self.name, None)
+        best = int(self._torch.argmax(scores).item())
+        bbox = boxes[best].detach().cpu().numpy().astype(float)
+        score = float(scores[best].detach().cpu().item())
+        mask = self._sam_mask(image, bbox)
+        position, mask = _estimate_world_position(observation, bbox, mask)
+        x1, y1, x2, y2 = bbox
+        return Detection(
+            success=position is not None,
+            backend=self.name,
+            target_position=position,
+            score=score,
+            bbox_xyxy=bbox,
+            centroid_px=np.array([0.5 * (x1 + x2), 0.5 * (y1 + y2)], dtype=float),
+            mask=mask,
+        )
+
+    def _sam_mask(self, image, bbox: np.ndarray) -> np.ndarray:
+        box = np.asarray(bbox, dtype=float).reshape(4).tolist()
+        with self._torch.no_grad():
+            inputs = self._sam_processor(image, input_boxes=[[[box]]], return_tensors="pt").to(self._device)
+            outputs = self._sam_model(**inputs)
+            masks = self._sam_processor.image_processor.post_process_masks(
+                outputs.pred_masks.detach().cpu(),
+                inputs["original_sizes"].detach().cpu(),
+                inputs["reshaped_input_sizes"].detach().cpu(),
+            )[0]
+        mask = masks[0, 0].numpy().astype(np.uint8) * 255
+        return mask
 
 
 def build_perception(name: str) -> PerceptionBackend:
@@ -96,6 +219,6 @@ def build_perception(name: str) -> PerceptionBackend:
         return OraclePerception()
     if normalized in {"color", "segmentation", "mask"}:
         return ColorSegmentationPerception()
-    if normalized in {"semantic", "grounding-dino", "grounded-sam2", "sam2"}:
+    if normalized in {"semantic", "grounding-dino", "grounded-sam", "grounded-sam2", "sam", "sam2"}:
         return SemanticPerception()
     raise ValueError(f"unknown detector '{name}'")

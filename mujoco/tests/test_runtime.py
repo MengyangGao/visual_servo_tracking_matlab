@@ -42,3 +42,20 @@ def test_headless_circle_smoke() -> None:
     summary = VisualServoSimulation(cfg).run()
     assert summary.steps == 120
     assert summary.final_error_m < summary.max_error_m
+
+
+def test_front_standoff_tracks_requested_distance() -> None:
+    cfg = DemoConfig(
+        target="box",
+        trajectory="static",
+        detector="oracle",
+        steps=240,
+        headless=True,
+        viewer=False,
+        realtime=False,
+        controller=ControllerConfig(task="front-standoff", standoff_m=0.12, control_hz=120.0),
+    )
+    summary = VisualServoSimulation(cfg).run()
+    assert summary.steps == 240
+    assert summary.final_error_m < 0.02
+    assert abs(summary.final_target_distance_m - 0.12) < 0.02

@@ -10,14 +10,16 @@ from .targets import TARGETS
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MuJoCo visual-servo tracking demo")
-    parser.add_argument("--target", default="cup", choices=sorted(TARGETS.keys()), help="target object")
+    parser.add_argument("--target", default="cup", help="target object word or phrase, e.g. cup, capsule, hammer, red apple")
     parser.add_argument("--trajectory", default="circle", choices=available_trajectories(), help="target motion")
     parser.add_argument("--task", default="contact", choices=available_tasks(), help="servo objective")
     parser.add_argument("--detector", default="oracle", choices=("oracle", "color", "semantic"), help="perception backend")
     parser.add_argument("--steps", type=int, default=1200, help="control steps to run")
     parser.add_argument("--headless", action="store_true", help="run without the MuJoCo viewer")
     parser.add_argument("--no-realtime", action="store_true", help="do not sleep to match wall-clock time")
-    parser.add_argument("--standoff", type=float, default=0.16, help="standoff distance for --task standoff")
+    parser.add_argument("--standoff", type=float, default=None, help="standoff distance in meters")
+    parser.add_argument("--standoff-cm", type=float, default=16.0, help="standoff distance in centimeters for standoff/front-standoff")
+    parser.add_argument("--list-targets", action="store_true", help="print built-in target words and exit")
     parser.add_argument("--seed", type=int, default=7, help="random seed for random-walk trajectory")
     parser.add_argument("--camera-width", type=int, default=640)
     parser.add_argument("--camera-height", type=int, default=480)
@@ -26,7 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def config_from_args(args: argparse.Namespace) -> DemoConfig:
     camera = CameraConfig(width=args.camera_width, height=args.camera_height)
-    controller = ControllerConfig(task=args.task, standoff_m=args.standoff)
+    standoff_m = float(args.standoff) if args.standoff is not None else float(args.standoff_cm) / 100.0
+    controller = ControllerConfig(task=args.task, standoff_m=standoff_m)
     return DemoConfig(
         target=args.target,
         trajectory=args.trajectory,
@@ -44,6 +47,9 @@ def config_from_args(args: argparse.Namespace) -> DemoConfig:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.list_targets:
+        print(json.dumps(sorted(TARGETS.keys()), indent=2))
+        return 0
     summary = run_demo(config_from_args(args))
     print(json.dumps(summary.as_dict(), indent=2, sort_keys=True))
     return 0

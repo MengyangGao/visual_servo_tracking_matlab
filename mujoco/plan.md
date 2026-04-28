@@ -4,6 +4,8 @@ Rebuild the `mujoco/` project into a clean MuJoCo visual-servo simulation: a vir
 
 Update: replace the procedural fallback robot as the default with Google DeepMind's official MuJoCo Menagerie Franka Emika Panda model, kept as a git submodule.
 
+Update 2: remove the procedural arm fallback entirely, make Menagerie Panda mandatory, add camera-derived semantic perception, expand word-addressable target objects, and add a horizontal front standoff task with CLI distance control.
+
 # User Value
 
 - Run a direct demo with `python scripts/demo.py` or `mjpython scripts/demo.py`.
@@ -17,14 +19,16 @@ Update: replace the procedural fallback robot as the default with Google DeepMin
 - Use the existing conda environment named `visual_servo`.
 - The user explicitly allowed deleting/replacing `src`, `tests`, and `pyproject.toml`.
 - Must support Python 3.10 because `visual_servo` is Python 3.10.
-- Use MuJoCo Menagerie as the preferred robot model source.
-- Keep the procedural arm as a fallback if the submodule is unavailable.
+- Use MuJoCo Menagerie as the required robot model source.
+- Remove the procedural arm fallback so there is a single robot source of truth.
 - [ASSUMPTION] Adding `.gitmodules` at the repository root is acceptable because git submodules require it, even though runtime code remains under `mujoco/`.
 - Keep push/PR out of scope unless the user explicitly approves later.
 
 # Assumptions
 
 - [ASSUMPTION] The submodule path should be `mujoco/vendor/mujoco_menagerie` so all model assets stay under `mujoco/`.
+- [ASSUMPTION] For camera-based semantic perception, the command loop may use rendered RGB-D from the fixed MuJoCo camera to estimate 3D target position from masks/bounding boxes.
+- [ASSUMPTION] "EE horizontal and facing the object at x cm" means the gripper tool axis points horizontally toward the target, with the EE placed `x` centimeters away from the target along the horizontal line from robot base to object.
 - [ASSUMPTION] The default high-quality demo should use oracle/simulation perception for stable closed-loop behavior, with image-based color segmentation available as a lightweight detector.
 - [ASSUMPTION] Advanced semantic backends such as Grounding DINO / SAM2 should be represented by a pluggable interface and optional dependency path, not required for the base demo.
 - [ASSUMPTION] The first acceptance target is contact tracking: the EE center converges to the target center with a small configurable radius.
@@ -79,6 +83,11 @@ Update: replace the procedural fallback robot as the default with Google DeepMin
 10. Load `franka_emika_panda/scene.xml` by default and inject the target, camera, and tracking sites.
 11. Keep the procedural scene builder as fallback for missing submodule/assets.
 12. Extend tests to assert the Menagerie Panda path is used when present.
+13. Remove all procedural arm generation code and fail fast if the Menagerie submodule is missing.
+14. Expand target library to include primitive and compound target bodies addressed by free-form words.
+15. Add camera observation plumbing: rendered RGB, rendered depth, intrinsics, and camera pose.
+16. Implement semantic perception using Grounding DINO for open-vocabulary boxes and SAM/SAM2-compatible mask extraction when optional dependencies are installed.
+17. Add `front-standoff` task mode with CLI distance in centimeters and 6D pose control.
 
 # Validation
 
@@ -96,11 +105,14 @@ Update: replace the procedural fallback robot as the default with Google DeepMin
 4. Menagerie Panda joint/body/site names differ from the procedural model, so controller discovery must be name-based and tested.
 5. Injecting custom world objects into an included Menagerie scene can conflict with duplicate worldbody/default/asset declarations; use a wrapper MJCF include instead of editing upstream XML.
 6. Menagerie actuator types/ranges may differ from the fallback model, so commands must map to named Panda actuators rather than assuming actuator order.
+7. Grounding DINO/SAM downloads are large and may be slow on first run; tests should validate wiring without requiring model weights.
+8. Depth unprojection depends on MuJoCo camera conventions; validate with color detector smoke tests against oracle behavior.
 
 # Risks
 
 - Menagerie is a larger git submodule and increases checkout/update time.
-- The fallback robot remains useful for offline development but should no longer be the default.
+- The robot model now requires the Menagerie submodule to be initialized.
+- Semantic perception quality depends on optional model availability and local hardware.
 - Installing MuJoCo/OpenCV into `visual_servo` may require network access.
 - Passive viewer validation may need a local GUI run with `mjpython` on macOS.
 
